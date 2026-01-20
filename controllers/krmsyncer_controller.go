@@ -123,16 +123,16 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 // SetupWithManager sets up the controller with the Manager.
 func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
-	
+
 	// Build the controller
 	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
 		Build(r)
-	
+
 	if err != nil {
 		return err
 	}
-	
+
 	r.Ctrl = c
 	return nil
 }
@@ -251,10 +251,10 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 		// If the Scheme has typed objects, it returns typed.
 		// `r.Client` uses the manager's scheme.
 		// `r.Scheme` (manager's scheme) likely has core types registered.
-		
+
 		// If we receive a typed object, we need to convert to Unstructured to strip fields easily.
 		uObj = &unstructured.Unstructured{}
-		
+
 		// Use runtime converter
 		unc, err := runtime.DefaultUnstructuredConverter.ToUnstructured(sourceObj)
 		if err != nil {
@@ -263,7 +263,7 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 		uObj.SetUnstructuredContent(unc)
 		uObj.SetGroupVersionKind(sourceObj.GetObjectKind().GroupVersionKind())
 	}
-	
+
 	// Sanitize
 	targetObj := uObj.DeepCopy()
 	targetObj.SetUID("")
@@ -271,9 +271,9 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 	targetObj.SetGeneration(0)
 	targetObj.SetOwnerReferences(nil)
 	targetObj.SetManagedFields(nil)
-	// Also clear namespace if mapping to a different one? 
+	// Also clear namespace if mapping to a different one?
 	// Requirement doesn't mention namespace mapping, so assume 1:1 namespace sync.
-	// But we need to ensure the namespace exists in destination? 
+	// But we need to ensure the namespace exists in destination?
 	// MVP: Assume it exists or let it fail.
 
 	// Apply to Destination
@@ -282,18 +282,18 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 		Version:  h.GVK.Version,
 		Resource: getResourceName(h.GVK.Kind), // Simple pluralization
 	}
-	
+
 	// We need GVR. We have GVK.
 	// To get GVR from GVK properly, we need a RESTMapper.
 	// But we don't have a RESTMapper for the *Destination* cluster handy (unless we build a client that has one).
 	// dynamic.Interface Resource() method takes GVR.
 	// We can guess GVR or use discovery.
-	
+
 	// For MVP, simple pluralization (lowercase + s) might work for standard resources.
 	// But for CRDs it might differ.
 	// Better: Use the Source Cluster's RESTMapper to find the GVR?
 	// Assuming Source and Destination have same API definitions.
-	
+
 	mapping, err := h.Client.RESTMapper().RESTMapping(h.GVK.GroupKind(), h.GVK.Version)
 	if err != nil {
 		return fmt.Errorf("failed to get REST mapping: %w", err)
@@ -302,12 +302,12 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 
 	// Create or Update (Server Side Apply is best, but "Apply" in requirements might just mean Create/Update)
 	// "Sync: Get Source Object -> Sanitize -> Apply to Destination."
-	
+
 	// Let's try Update first, if fails try Create? Or Get then Update?
 	// SSA is easiest if supported.
 	// dynamic client doesn't support Apply easily in older versions?
 	// v0.28 supports Apply.
-	
+
 	_, err = dynClient.Resource(gvr).Namespace(targetObj.GetNamespace()).Apply(ctx, targetObj.GetName(), targetObj, metav1.ApplyOptions{FieldManager: "krmsyncer", Force: true})
 	if err != nil {
 		return fmt.Errorf("failed to apply resource: %w", err)
@@ -317,12 +317,12 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 	if _, ok := targetObj.Object["status"]; ok {
 		_, err = dynClient.Resource(gvr).Namespace(targetObj.GetNamespace()).Apply(ctx, targetObj.GetName(), targetObj, metav1.ApplyOptions{FieldManager: "krmsyncer", Force: true}, "status")
 		if err != nil {
-			// We log and return error, but it might fail if status subresource is not enabled. 
+			// We log and return error, but it might fail if status subresource is not enabled.
 			// For MVP we assume if status is present, we should sync it.
 			return fmt.Errorf("failed to apply status: %w", err)
 		}
 	}
-	
+
 	return nil
 }
 

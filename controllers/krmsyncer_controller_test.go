@@ -29,7 +29,7 @@ var _ = Describe("KRMSyncer Controller", func() {
 
 			// 1. Setup Manager
 			mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-				Scheme: scheme,
+				Scheme:  scheme,
 				Metrics: metricsserver.Options{BindAddress: "0"}, // Disable metrics
 			})
 			Expect(err).ToNot(HaveOccurred())
@@ -89,7 +89,7 @@ var _ = Describe("KRMSyncer Controller", func() {
 
 			// 4. Create ConfigMap and Verify Sync
 			// Since we sync to the same cluster, we check if the object is updated with FieldManager="krmsyncer"
-			
+
 			cm := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					GenerateName: "test-cm-",
@@ -105,7 +105,7 @@ var _ = Describe("KRMSyncer Controller", func() {
 				if err != nil {
 					return false
 				}
-				
+
 				// Check ManagedFields
 				for _, entry := range updatedCm.ManagedFields {
 					if entry.Manager == "krmsyncer" {
@@ -172,8 +172,10 @@ var _ = Describe("KRMSyncer Controller", func() {
 			Eventually(func() bool {
 				var checkSyncer krmv1alpha1.KRMSyncer
 				err := k8sClient.Get(ctx, types.NamespacedName{Name: krmSyncer.Name, Namespace: krmSyncer.Namespace}, &checkSyncer)
-				if err != nil { return false }
-				
+				if err != nil {
+					return false
+				}
+
 				for _, cond := range checkSyncer.Status.Conditions {
 					if cond.Type == "Suspended" && cond.Status == metav1.ConditionTrue {
 						return true
@@ -181,7 +183,6 @@ var _ = Describe("KRMSyncer Controller", func() {
 				}
 				return false
 			}, timeout, interval).Should(BeTrue())
-
 
 		})
 	})
@@ -218,6 +219,6 @@ func createKubeConfig(cfg *rest.Config) ([]byte, error) { // Note: cfg is *rest.
 		CurrentContext: "default-context",
 		AuthInfos:      authinfos,
 	}
-	
+
 	return clientcmd.Write(clientConfig)
 }

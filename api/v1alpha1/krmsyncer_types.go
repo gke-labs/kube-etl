@@ -32,9 +32,9 @@ type DestinationConfig struct {
 // KRMSyncerSpec defines the desired state.
 // +kubebuilder:object:generate=true
 type KRMSyncerSpec struct {
-    // Suspend tells the controller to suspend the sync operations.
-    // +optional
-    Suspend bool `json:"suspend,omitempty"`
+	// Suspend tells the controller to suspend the sync operations.
+	// +optional
+	Suspend bool `json:"suspend,omitempty"`
 
 	// Destination defines the target for the sync.
 	Destination DestinationConfig `json:"destination"`
