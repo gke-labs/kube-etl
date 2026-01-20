@@ -295,6 +295,16 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 	if err != nil {
 		return fmt.Errorf("failed to apply resource: %w", err)
 	}
+
+	// Status Sync: Explicitly sync the status subresource if the object has one.
+	if _, ok := targetObj.Object["status"]; ok {
+		_, err = dynClient.Resource(gvr).Namespace(targetObj.GetNamespace()).Apply(ctx, targetObj.GetName(), targetObj, metav1.ApplyOptions{FieldManager: "krmsyncer", Force: true}, "status")
+		if err != nil {
+			// We log and return error, but it might fail if status subresource is not enabled. 
+			// For MVP we assume if status is present, we should sync it.
+			return fmt.Errorf("failed to apply status: %w", err)
+		}
+	}
 	
 	return nil
 }
