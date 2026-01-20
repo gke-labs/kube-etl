@@ -154,6 +154,34 @@ var _ = Describe("KRMSyncer Controller", func() {
 				return false
 			}, timeout, interval).Should(BeTrue())
 
+			// 7. Test Suspend Status
+			Eventually(func() error {
+				var currentSyncer krmv1alpha1.KRMSyncer
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: krmSyncer.Name, Namespace: krmSyncer.Namespace}, &currentSyncer)
+				if err != nil {
+					return err
+				}
+				currentSyncer.Spec.Suspend = true
+				return k8sClient.Update(ctx, &currentSyncer)
+			}, timeout, interval).Should(Succeed())
+
+			// Wait for cache to sync
+			time.Sleep(2 * time.Second)
+
+			// Verify Status is Suspended
+			Eventually(func() bool {
+				var checkSyncer krmv1alpha1.KRMSyncer
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: krmSyncer.Name, Namespace: krmSyncer.Namespace}, &checkSyncer)
+				if err != nil { return false }
+				
+				for _, cond := range checkSyncer.Status.Conditions {
+					if cond.Type == "Suspended" && cond.Status == metav1.ConditionTrue {
+						return true
+					}
+				}
+				return false
+			}, timeout, interval).Should(BeTrue())
+
 
 		})
 	})

@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -53,14 +54,30 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Update Status if needed (e.g., observed generation)
-	// For MVP, we just proceed.
+	// Update Status if needed
+	defer func() {
+		if err := r.Status().Update(ctx, &krmSyncer); err != nil {
+			logger.Error(err, "Failed to update KRMSyncer status")
+		}
+	}()
 
 	if krmSyncer.Spec.Suspend {
+		meta.SetStatusCondition(&krmSyncer.Status.Conditions, metav1.Condition{
+			Type:    "Suspended",
+			Status:  metav1.ConditionTrue,
+			Reason:  "SuspendedBySpec",
+			Message: "Controller is suspended",
+		})
 		logger.Info("KRMSyncer is suspended", "name", krmSyncer.Name)
-		// We might want to update status here
 		return ctrl.Result{}, nil
 	}
+
+	meta.SetStatusCondition(&krmSyncer.Status.Conditions, metav1.Condition{
+		Type:    "Suspended",
+		Status:  metav1.ConditionFalse,
+		Reason:  "Active",
+		Message: "Controller is active",
+	})
 
 	// Dynamic Watch Registration
 	r.mu.Lock()
