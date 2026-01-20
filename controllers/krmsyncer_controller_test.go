@@ -114,6 +114,47 @@ var _ = Describe("KRMSyncer Controller", func() {
 				}
 				return false
 			}, timeout, interval).Should(BeTrue())
+
+			// 5. Update KRMSyncer to add Secret Rule
+			Eventually(func() error {
+				var currentSyncer krmv1alpha1.KRMSyncer
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: krmSyncer.Name, Namespace: krmSyncer.Namespace}, &currentSyncer)
+				if err != nil {
+					return err
+				}
+				currentSyncer.Spec.Rules = append(currentSyncer.Spec.Rules, krmv1alpha1.ResourceRule{
+					Group:   "",
+					Version: "v1",
+					Kind:    "Secret",
+				})
+				return k8sClient.Update(ctx, &currentSyncer)
+			}, timeout, interval).Should(Succeed())
+
+			// 6. Create Secret and Verify Sync
+			secretSource := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "test-secret-",
+					Namespace:    "default",
+				},
+				Data: map[string][]byte{"foo": []byte("bar")},
+			}
+			Expect(k8sClient.Create(ctx, secretSource)).To(Succeed())
+
+			Eventually(func() bool {
+				updatedSecret := &corev1.Secret{}
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: secretSource.Name, Namespace: secretSource.Namespace}, updatedSecret)
+				if err != nil {
+					return false
+				}
+				for _, entry := range updatedSecret.ManagedFields {
+					if entry.Manager == "krmsyncer" {
+						return true
+					}
+				}
+				return false
+			}, timeout, interval).Should(BeTrue())
+
+
 		})
 	})
 })
