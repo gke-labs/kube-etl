@@ -1,0 +1,11 @@
+# Binaries
+bin/
+syncer/bin/
+
+# Test artifacts
+cover.out
+syncer/cover.out
+
+# Go
+vendor/
+go.work
