@@ -272,7 +272,6 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 	targetObj.SetOwnerReferences(nil)
 	targetObj.SetManagedFields(nil)
 
-	// Handle Namespace Override
 	if syncer.Spec.Destination.Namespace != "" {
 		targetObj.SetNamespace(syncer.Spec.Destination.Namespace)
 	}
@@ -281,30 +280,18 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 	gvr := schema.GroupVersionResource{
 		Group:    h.GVK.Group,
 		Version:  h.GVK.Version,
-		Resource: getResourceName(h.GVK.Kind), // Simple pluralization
+		Resource: getResourceName(h.GVK.Kind), // Fallback
 	}
 
-	// We need GVR. We have GVK.
-	// To get GVR from GVK properly, we need a RESTMapper.
-	// But we don't have a RESTMapper for the *Destination* cluster handy (unless we build a client that has one).
-	// dynamic.Interface Resource() method takes GVR.
-	// We can guess GVR or use discovery.
-
-	// For MVP, simple pluralization (lowercase + s) might work for standard resources.
-	// But for CRDs it might differ.
-	// Better: Use the Source Cluster's RESTMapper to find the GVR?
-	// Assuming Source and Destination have same API definitions.
-
+	// Use the Source Cluster's RESTMapper to find the GVR.
+	// We assume Source and Destination have same API definitions for the watched resources.
 	mapping, err := h.Client.RESTMapper().RESTMapping(h.GVK.GroupKind(), h.GVK.Version)
 	if err != nil {
 		return fmt.Errorf("failed to get REST mapping: %w", err)
 	}
 	gvr = mapping.Resource
 
-	// Create or Update (Server Side Apply is best, but "Apply" in requirements might just mean Create/Update)
-
-	// "Sync: Get Source Object -> Sanitize -> Apply to Destination."
-
+	// Sync: Get Source Object -> Sanitize -> Apply to Destination.
 	_, err = dynClient.Resource(gvr).Namespace(targetObj.GetNamespace()).Apply(ctx, targetObj.GetName(), targetObj, metav1.ApplyOptions{FieldManager: "krmsyncer", Force: true})
 
 	if err != nil {
