@@ -1,5 +1,5 @@
 // +kubebuilder:object:generate=true
-// +groupName=krm.gke.io
+// +groupName=syncer.gkelabs.io
 package v1alpha1
 
 import (
@@ -9,7 +9,7 @@ import (
 
 var (
 	// GroupVersion is group version used to register these objects
-	GroupVersion = schema.GroupVersion{Group: "krm.gke.io", Version: "v1alpha1"}
+	GroupVersion = schema.GroupVersion{Group: "syncer.gkelabs.io", Version: "v1alpha1"}
 
 	// SchemeBuilder is used to add go types to the GroupVersionKind scheme
 	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}

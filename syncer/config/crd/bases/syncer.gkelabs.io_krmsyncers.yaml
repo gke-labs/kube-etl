@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.14.0
-  name: krmsyncers.krm.gke.io
+  name: krmsyncers.syncer.gkelabs.io
 spec:
-  group: krm.gke.io
+  group: syncer.gkelabs.io
   names:
     kind: KRMSyncer
     listKind: KRMSyncerList
@@ -57,6 +57,11 @@ spec:
                         type: string
                     type: object
                     x-kubernetes-map-type: atomic
+                  namespace:
+                    description: |-
+                      Namespace defines the target namespace to sync resources to.
+                      If not specified, the resource is synced to the same namespace as the source.
+                    type: string
                 type: object
               rules:
                 description: Rules defines which resources to watch and sync.

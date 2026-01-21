@@ -184,6 +184,43 @@ var _ = Describe("KRMSyncer Controller", func() {
 				return false
 			}, timeout, interval).Should(BeTrue())
 
+			// 8. Test Namespace Override
+			// Create Dest Namespace
+			destNs := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "dest-ns"}}
+			Expect(k8sClient.Create(ctx, destNs)).To(Succeed())
+
+			// Unsuspend and Set Namespace
+			Eventually(func() error {
+				var currentSyncer krmv1alpha1.KRMSyncer
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: krmSyncer.Name, Namespace: krmSyncer.Namespace}, &currentSyncer)
+				if err != nil {
+					return err
+				}
+				currentSyncer.Spec.Suspend = false
+				currentSyncer.Spec.Destination.Namespace = "dest-ns"
+				return k8sClient.Update(ctx, &currentSyncer)
+			}, timeout, interval).Should(Succeed())
+
+			// Wait for cache/suspend status update
+			time.Sleep(2 * time.Second)
+
+			// Create new ConfigMap
+			cm2 := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "test-cm-ns-",
+					Namespace:    "default",
+				},
+				Data: map[string]string{"foo": "baz"},
+			}
+			Expect(k8sClient.Create(ctx, cm2)).To(Succeed())
+
+			// Verify cm2 exists in dest-ns
+			Eventually(func() bool {
+				syncedCm := &corev1.ConfigMap{}
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: cm2.Name, Namespace: "dest-ns"}, syncedCm)
+				return err == nil
+			}, timeout, interval).Should(BeTrue())
+
 		})
 	})
 })

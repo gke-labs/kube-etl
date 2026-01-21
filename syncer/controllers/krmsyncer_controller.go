@@ -40,8 +40,8 @@ type KRMSyncerReconciler struct {
 	mu          sync.RWMutex
 }
 
-//+kubebuilder:rbac:groups=krm.gke.io,resources=krmsyncers,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=krm.gke.io,resources=krmsyncers/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=syncer.gkelabs.io,resources=krmsyncers,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=syncer.gkelabs.io,resources=krmsyncers/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 
@@ -271,10 +271,11 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 	targetObj.SetGeneration(0)
 	targetObj.SetOwnerReferences(nil)
 	targetObj.SetManagedFields(nil)
-	// Also clear namespace if mapping to a different one?
-	// Requirement doesn't mention namespace mapping, so assume 1:1 namespace sync.
-	// But we need to ensure the namespace exists in destination?
-	// MVP: Assume it exists or let it fail.
+	
+	// Handle Namespace Override
+	if syncer.Spec.Destination.Namespace != "" {
+		targetObj.SetNamespace(syncer.Spec.Destination.Namespace)
+	}
 
 	// Apply to Destination
 	gvr := schema.GroupVersionResource{
@@ -300,15 +301,15 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 	}
 	gvr = mapping.Resource
 
-	// Create or Update (Server Side Apply is best, but "Apply" in requirements might just mean Create/Update)
-	// "Sync: Get Source Object -> Sanitize -> Apply to Destination."
+		// Create or Update (Server Side Apply is best, but "Apply" in requirements might just mean Create/Update)
 
-	// Let's try Update first, if fails try Create? Or Get then Update?
-	// SSA is easiest if supported.
-	// dynamic client doesn't support Apply easily in older versions?
-	// v0.28 supports Apply.
+		// "Sync: Get Source Object -> Sanitize -> Apply to Destination."
 
-	_, err = dynClient.Resource(gvr).Namespace(targetObj.GetNamespace()).Apply(ctx, targetObj.GetName(), targetObj, metav1.ApplyOptions{FieldManager: "krmsyncer", Force: true})
+		
+
+		_, err = dynClient.Resource(gvr).Namespace(targetObj.GetNamespace()).Apply(ctx, targetObj.GetName(), targetObj, metav1.ApplyOptions{FieldManager: "krmsyncer", Force: true})
+
+	
 	if err != nil {
 		return fmt.Errorf("failed to apply resource: %w", err)
 	}

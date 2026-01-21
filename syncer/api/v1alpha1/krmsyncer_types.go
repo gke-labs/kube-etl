@@ -27,6 +27,11 @@ type DestinationConfig struct {
 	// kubeconfig of the destination cluster.
 	// +optional
 	KubeConfigSecretRef *corev1.SecretReference `json:"kubeConfigSecretRef,omitempty"`
+
+	// Namespace defines the target namespace to sync resources to.
+	// If not specified, the resource is synced to the same namespace as the source.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // KRMSyncerSpec defines the desired state.
