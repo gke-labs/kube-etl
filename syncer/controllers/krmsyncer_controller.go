@@ -271,7 +271,7 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 	targetObj.SetGeneration(0)
 	targetObj.SetOwnerReferences(nil)
 	targetObj.SetManagedFields(nil)
-	
+
 	// Handle Namespace Override
 	if syncer.Spec.Destination.Namespace != "" {
 		targetObj.SetNamespace(syncer.Spec.Destination.Namespace)
@@ -301,15 +301,12 @@ func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMS
 	}
 	gvr = mapping.Resource
 
-		// Create or Update (Server Side Apply is best, but "Apply" in requirements might just mean Create/Update)
+	// Create or Update (Server Side Apply is best, but "Apply" in requirements might just mean Create/Update)
 
-		// "Sync: Get Source Object -> Sanitize -> Apply to Destination."
+	// "Sync: Get Source Object -> Sanitize -> Apply to Destination."
 
-		
+	_, err = dynClient.Resource(gvr).Namespace(targetObj.GetNamespace()).Apply(ctx, targetObj.GetName(), targetObj, metav1.ApplyOptions{FieldManager: "krmsyncer", Force: true})
 
-		_, err = dynClient.Resource(gvr).Namespace(targetObj.GetNamespace()).Apply(ctx, targetObj.GetName(), targetObj, metav1.ApplyOptions{FieldManager: "krmsyncer", Force: true})
-
-	
 	if err != nil {
 		return fmt.Errorf("failed to apply resource: %w", err)
 	}
