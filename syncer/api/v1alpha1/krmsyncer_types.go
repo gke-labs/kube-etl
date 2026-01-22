@@ -22,14 +22,13 @@ import (
 // ResourceRule defines criteria for what to sync.
 // +kubebuilder:object:generate=true
 type ResourceRule struct {
-	// Group is the API group of the resource
+	// Group is the API group of the resource to be synchronized.
 	Group string `json:"group"`
-	// Version is the API version of the resource
+	// Version is the API version of the resource to be synchronized.
 	Version string `json:"version"`
-	// Kind is the Kind of the resource
+	// Kind is the Kind of the resource to be synchronized.
 	Kind string `json:"kind"`
-
-	// Namespaces to filter source objects.
+	// Namespaces is an optional list of namespaces to watch. If not provided, all namespaces are synchronized.
 	// +optional
 	Namespaces []string `json:"namespaces,omitempty"`
 }
@@ -37,15 +36,25 @@ type ResourceRule struct {
 // DestinationConfig defines where to push resources.
 // +kubebuilder:object:generate=true
 type DestinationConfig struct {
+	// +optional
+	// ClusterConfig defines the configuration for syncing to a remote Kubernetes cluster.
+	ClusterConfig *ClusterConfig `json:"clusterConfig,omitempty"`
+	// +optional
+	// GCSBucketConfig defines the configuration for syncing to a Google Cloud Storage bucket.
+	GCSBucketConfig *GCSBucketConfig `json:"gcsBucketConfig,omitempty"`
+}
+
+type ClusterConfig struct {
 	// KubeConfigSecretRef is the reference to the secret containing the
 	// kubeconfig of the destination cluster.
-	// +optional
-	KubeConfigSecretRef *corev1.SecretReference `json:"kubeConfigSecretRef,omitempty"`
+	KubeConfigSecretRef *corev1.SecretReference `json:"kubeConfigSecretRef"`
+}
 
-	// Namespace defines the target namespace to sync resources to.
-	// If not specified, the resource is synced to the same namespace as the source.
-	// +optional
-	Namespace string `json:"namespace,omitempty"`
+type GCSBucketConfig struct {
+	// InstallationName is the name of the installation, used as a prefix in the GCS bucket path.
+	InstallationName string `json:"installationName"`
+	// GCSBucketName is the name of the Google Cloud Storage bucket where resources will be stored.
+	GCSBucketName string `json:"gcsBucketName"`
 }
 
 // KRMSyncerSpec defines the desired state.
@@ -56,16 +65,16 @@ type KRMSyncerSpec struct {
 	Suspend bool `json:"suspend,omitempty"`
 
 	// Destination defines the target for the sync.
-	Destination DestinationConfig `json:"destination"`
+	Destination *DestinationConfig `json:"destination"`
 
-	// Rules defines which resources to watch and sync.
+	// Rules defines which resources to watch and sync. If unset, sync all resources by default.
 	Rules []ResourceRule `json:"rules"`
 }
 
 // KRMSyncerStatus defines the observed state.
 // +kubebuilder:object:generate=true
 type KRMSyncerStatus struct {
-	// Conditions of the Syncer (e.g., DestinationUnreachable, Suspended).
+	// Conditions of the Syncer.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
