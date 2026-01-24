@@ -23,9 +23,13 @@ test: fmt vet ## Run tests.
 
 .PHONY: build
 build: fmt vet ## Build manager binary.
-	go build -o bin/manager main.go
+	go build -o bin/manager cmd/manager/main.go
+
+.PHONY: build-cli
+build-cli: fmt vet ## Build kube-etl binary.
+	go build -o bin/kube-etl main.go
 
 .PHONY: run
 run: fmt vet ## Run a controller from your host.
-	go run ./main.go
+	go run ./cmd/manager/main.go
 
