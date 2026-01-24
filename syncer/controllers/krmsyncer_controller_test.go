@@ -32,7 +32,7 @@ func TestSyncerSync(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	// Start Source Cluster
 	testEnvSource := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
 	}
 	cfgSource, err := testEnvSource.Start()
@@ -40,7 +40,7 @@ func TestSyncerSync(t *testing.T) {
 
 	// Start Destination Cluster
 	testEnvDest := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
 	}
 	cfgDest, err := testEnvDest.Start()

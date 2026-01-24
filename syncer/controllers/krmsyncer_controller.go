@@ -6,6 +6,7 @@ import (
 	krmv1alpha1 "github.com/gke-labs/kube-etl/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sync"
 	"time"
 
@@ -66,7 +67,7 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	meta.SetStatusCondition(&krmSyncer.Status.Conditions, metav1.Condition{
 		Type:    "Active",
-		Status:  metav1.ConditionFalse,
+		Status:  metav1.ConditionTrue,
 		Reason:  "Active",
 		Message: "Controller is active",
 	})
@@ -75,7 +76,14 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 func (r *KRMSyncerReconciler) reconcile(ctx context.Context, syncer *krmv1alpha1.KRMSyncer) (ctrl.Result, error) {
-	// logger := log.FromContext(ctx)
+	logger := log.FromContext(ctx)
+
+	// Prune orphans first
+	// todo: the prune logic will run on every reconcile loop, which can be expensive.
+	if err := r.pruneOrphans(ctx, syncer); err != nil {
+		// Log error but continue to start dynamic resource watchers
+		log.Log.Error(err, "Failed to prune orphans")
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -88,11 +96,10 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, syncer *krmv1alpha1
 		}
 
 		if !r.WatchedGVKs[gvk] {
-			if err := r.startWatcher(ctx, gvk); err != nil {
-				// log.Log.Error(err, "Failed to start watcher for GVK", "gvk", gvk)
+			if err := r.startDynamicResourceWatcher(ctx, gvk); err != nil {
+				logger.Error(err, "Failed to start watcher for GVK", "gvk", gvk)
 				continue
 			}
-
 			r.WatchedGVKs[gvk] = true
 		}
 	}
@@ -100,7 +107,58 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, syncer *krmv1alpha1
 	return ctrl.Result{}, nil
 }
 
-func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.GroupVersionKind) error {
+func (r *KRMSyncerReconciler) pruneOrphans(ctx context.Context, syncer *krmv1alpha1.KRMSyncer) error {
+	logger := log.FromContext(ctx)
+	remoteClient, err := GetRemoteClient(ctx, r.Client, syncer)
+	if err != nil {
+		return err
+	}
+
+	// Watch all resources match spec.rules
+	for _, rule := range syncer.Spec.Rules {
+		gvk := schema.GroupVersionKind{
+			Group:   rule.Group,
+			Version: rule.Version,
+			Kind:    rule.Kind,
+		}
+
+		for _, ns := range rule.Namespaces {
+			watchList := &unstructured.UnstructuredList{}
+			watchList.SetGroupVersionKind(gvk)
+			var opts []client.ListOption
+			if ns != "" {
+				opts = append(opts, client.InNamespace(ns))
+			}
+
+			if err := remoteClient.List(ctx, watchList, opts...); err != nil {
+				// If resource type not found on remote, ignore
+				if meta.IsNoMatchError(err) {
+					continue
+				}
+				logger.Error(err, "Failed to list resources on remote cluster", "gvk", gvk)
+				continue
+			}
+
+			for _, remoteObj := range watchList.Items {
+				// Check if exists locally
+				localObj := &unstructured.Unstructured{}
+				localObj.SetGroupVersionKind(gvk)
+				err := r.Get(ctx, types.NamespacedName{Name: remoteObj.GetName(), Namespace: remoteObj.GetNamespace()}, localObj)
+				if errors.IsNotFound(err) {
+					logger.Info("Pruning orphan resource from remote cluster", "name", remoteObj.GetName(), "namespace", remoteObj.GetNamespace())
+					if err := remoteClient.Delete(ctx, &remoteObj); err != nil {
+						logger.Error(err, "Failed to delete orphan resource on remote cluster")
+					}
+				} else if err != nil {
+					logger.Error(err, "Failed to check local resource existence")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (r *KRMSyncerReconciler) startDynamicResourceWatcher(ctx context.Context, gvk schema.GroupVersionKind) error {
 	dr := &DynamicResourceReconciler{
 		Client: r.Client,
 		GVK:    gvk,
@@ -176,7 +234,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			// Get Remote Client
-			remoteClient, err := r.getRemoteClient(ctx, &syncer)
+			remoteClient, err := GetRemoteClient(ctx, r.Client, &syncer)
 			if err != nil {
 				logger.Error(err, "Failed to get remote client")
 				continue
@@ -218,7 +276,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	return ctrl.Result{}, nil
 }
 
-func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, syncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
+func GetRemoteClient(ctx context.Context, localClient client.Reader, syncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
 	if syncer.Spec.Destination == nil || syncer.Spec.Destination.ClusterConfig == nil || syncer.Spec.Destination.ClusterConfig.KubeConfigSecretRef == nil {
 		return nil, fmt.Errorf("KubeConfigSecretRef not specified")
 	}
@@ -228,7 +286,7 @@ func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, syncer 
 		Name:      syncer.Spec.Destination.ClusterConfig.KubeConfigSecretRef.Name,
 		Namespace: syncer.Namespace, // Secret must be in the same namespace as Syncer
 	}
-	if err := r.Get(ctx, key, secret); err != nil {
+	if err := localClient.Get(ctx, key, secret); err != nil {
 		return nil, err
 	}
 
