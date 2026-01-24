@@ -1,3 +1,17 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package export
 
 import (
@@ -94,8 +108,8 @@ func TestExport(t *testing.T) {
 		// We expect at least the default namespace or kube-system
 		// Path structure: <namespace>/<group>/<kind>/<name>.yaml
 		// Namespace objects are cluster scoped, so they will be in _cluster namespace folder.
-		if f.Name == "_cluster/core/Namespace/default.yaml" || 
-           f.Name == "_cluster/core/Namespace/kube-system.yaml" {
+		if f.Name == "_cluster/core/Namespace/default.yaml" ||
+			f.Name == "_cluster/core/Namespace/kube-system.yaml" {
 			foundNamespace = true
 			break
 		}
@@ -103,8 +117,8 @@ func TestExport(t *testing.T) {
 
 	if !foundNamespace {
 		t.Errorf("Did not find expected namespace in zip file. Files found: %d", len(r.File))
-        for _, f := range r.File {
-            t.Logf("Found file: %s", f.Name)
-        }
+		for _, f := range r.File {
+			t.Logf("Found file: %s", f.Name)
+		}
 	}
 }
