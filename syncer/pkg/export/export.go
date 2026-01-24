@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/gke-labs/kube-etl/pkg/sink"
+	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
@@ -20,8 +21,32 @@ type ExportOptions struct {
 	Output string
 }
 
-func (o *ExportOptions) Run(ctx context.Context) error {
-	s, err := sink.NewZipSink(o.Output)
+func (o *ExportOptions) InitDefaults() {
+	// No defaults for now
+}
+
+func BuildExportCommand() *cobra.Command {
+	var opt ExportOptions
+	opt.InitDefaults()
+
+	cmd := &cobra.Command{
+		Use:   "export",
+		Short: "Export Kubernetes objects from the current cluster",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if opt.Output == "" {
+				return fmt.Errorf("required flag(s) \"output\" not set")
+			}
+			return Run(cmd.Context(), opt)
+		},
+	}
+
+	cmd.Flags().StringVar(&opt.Output, "output", opt.Output, "Path to the output file (e.g. output.zip)")
+
+	return cmd
+}
+
+func Run(ctx context.Context, opt ExportOptions) error {
+	s, err := sink.NewZipSink(opt.Output)
 	if err != nil {
 		return fmt.Errorf("failed to create sink: %w", err)
 	}
