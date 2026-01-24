@@ -51,6 +51,7 @@ var _ = BeforeSuite(func() {
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd", "bases")}, // We don't have this yet
 		ErrorIfCRDPathMissing: true,                                                    // For now
+		DownloadBinaryAssets:  true,
 	}
 
 	var err error
