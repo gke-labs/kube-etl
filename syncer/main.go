@@ -29,8 +29,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	krmv1alpha1 "github.com/gke-labs/kube-etl/api/v1alpha1"
-	"github.com/gke-labs/kube-etl/controllers"
+	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
+	"github.com/gke-labs/kube-etl/syncer/controllers"
 )
 
 var (
