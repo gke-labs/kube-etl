@@ -120,7 +120,7 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 			// Call controller.Watch
 			// We watch the unstructured object type
-			err := r.Ctrl.Watch(source.Kind(r.Cache, u), h)
+			err := r.Ctrl.Watch(source.Kind(r.Cache, u, h))
 			if err != nil {
 				logger.Error(err, "Failed to watch GVK", "gvk", gvk)
 				// Continue or return error? For MVP, log and continue.
@@ -157,19 +157,19 @@ type SyncHandler struct {
 	GVK    schema.GroupVersionKind
 }
 
-func (h *SyncHandler) Create(ctx context.Context, e event.CreateEvent, q workqueue.RateLimitingInterface) {
+func (h *SyncHandler) Create(ctx context.Context, e event.TypedCreateEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
 	h.handle(ctx, e.Object)
 }
 
-func (h *SyncHandler) Update(ctx context.Context, e event.UpdateEvent, q workqueue.RateLimitingInterface) {
+func (h *SyncHandler) Update(ctx context.Context, e event.TypedUpdateEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
 	h.handle(ctx, e.ObjectNew)
 }
 
-func (h *SyncHandler) Delete(ctx context.Context, e event.DeleteEvent, q workqueue.RateLimitingInterface) {
+func (h *SyncHandler) Delete(ctx context.Context, e event.TypedDeleteEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
 	// MVP: No delete sync mandated, but good practice. Skipping for now as per "Sync resources from Local...".
 }
 
-func (h *SyncHandler) Generic(ctx context.Context, e event.GenericEvent, q workqueue.RateLimitingInterface) {
+func (h *SyncHandler) Generic(ctx context.Context, e event.TypedGenericEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
 	h.handle(ctx, e.Object)
 }
 
