@@ -5,16 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/gke-labs/kube-etl/pkg/sink"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"sigs.k8s.io/yaml"
+	sigs "sigs.k8s.io/yaml"
 )
 
 type ExportOptions struct {
@@ -33,10 +35,10 @@ func BuildExportCommand() *cobra.Command {
 		Use:   "export",
 		Short: "Export Kubernetes objects from the current cluster",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if opt.Output == "" {
-				return fmt.Errorf("required flag(s) \"output\" not set")
+			if len(args) > 0 {
+				return fmt.Errorf("unexpected arguments: %v", args)
 			}
-			return Run(cmd.Context(), opt)
+			return RunExport(cmd.Context(), opt)
 		},
 	}
 
@@ -45,7 +47,11 @@ func BuildExportCommand() *cobra.Command {
 	return cmd
 }
 
-func Run(ctx context.Context, opt ExportOptions) error {
+func RunExport(ctx context.Context, opt ExportOptions) error {
+	if opt.Output == "" {
+		return fmt.Errorf("required flag(s) \"output\" not set")
+	}
+
 	s, err := sink.NewZipSink(opt.Output)
 	if err != nil {
 		return fmt.Errorf("failed to create sink: %w", err)
@@ -60,17 +66,23 @@ func Run(ctx context.Context, opt ExportOptions) error {
 		return fmt.Errorf("failed to get k8s config: %w", err)
 	}
 
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	httpClient, err := rest.HTTPClientFor(config)
+	if err != nil {
+		return fmt.Errorf("failed to create http client: %w", err)
+	}
+
+	discoveryClient, err := discovery.NewDiscoveryClientForConfigAndClient(config, httpClient)
 	if err != nil {
 		return fmt.Errorf("failed to create discovery client: %w", err)
 	}
 
-	dynamicClient, err := dynamic.NewForConfig(config)
+	dynamicClient, err := dynamic.NewForConfigAndClient(config, httpClient)
 	if err != nil {
 		return fmt.Errorf("failed to create dynamic client: %w", err)
 	}
 
 	lists, err := discoveryClient.ServerPreferredResources()
+	var errs []error
 	if err != nil {
 		if !discovery.IsGroupDiscoveryFailedError(err) {
 			// If it's a critical error, we might want to fail, but often discovery has partial errors.
@@ -78,11 +90,9 @@ func Run(ctx context.Context, opt ExportOptions) error {
 			if len(lists) == 0 {
 				return fmt.Errorf("failed to discover resources: %w", err)
 			}
-			fmt.Printf("Warning: partial discovery error: %v\n", err)
+			errs = append(errs, fmt.Errorf("partial discovery error: %w", err))
 		}
 	}
-
-	var errs []error
 
 	for _, list := range lists {
 		groupVersion, err := schema.ParseGroupVersion(list.GroupVersion)
@@ -92,7 +102,7 @@ func Run(ctx context.Context, opt ExportOptions) error {
 		}
 
 		for _, resource := range list.APIResources {
-			if !contains(resource.Verbs, "list") {
+			if !slices.Contains(resource.Verbs, "list") {
 				continue
 			}
 
@@ -125,7 +135,7 @@ func Run(ctx context.Context, opt ExportOptions) error {
 
 				path := filepath.Join(ns, group, kind, name+".yaml")
 
-				data, err := yaml.Marshal(item.Object)
+				data, err := sigs.Marshal(item.Object)
 				if err != nil {
 					errs = append(errs, fmt.Errorf("failed to marshal %s/%s: %w", kind, name, err))
 					continue
@@ -141,13 +151,4 @@ func Run(ctx context.Context, opt ExportOptions) error {
 	}
 
 	return errors.Join(errs...)
-}
-
-func contains(slice []string, s string) bool {
-	for _, item := range slice {
-		if item == s {
-			return true
-		}
-	}
-	return false
 }
