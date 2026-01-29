@@ -293,6 +293,8 @@ func (r *DynamicResourceReconciler) applyToRemote(ctx context.Context, remoteCli
 	case schema.GroupKind{Group: "tags.cnrm.cloud.google.com", Kind: "TagsTagValue"}:
 	case schema.GroupKind{Group: "vertexai.cnrm.cloud.google.com", Kind: "VertexAIDataset"}:
 	case schema.GroupKind{Group: "vertexai.cnrm.cloud.google.com", Kind: "VertexAIIndex"}:
+	// Fake GV added only for integration test
+	case schema.GroupKind{Group: "e2e.gkelabs.io", Kind: "ResourceWithServiceGeneratedID"}:
 		// Retrieve the service-generated resourceID from resource's spec.resourceID(legacy)
 		// or from status.externalRef(direct) and write back to spec.resourceID for acquisition.
 		resourceID, _, err := unstructured.NestedString(remoteObj.Object, "spec", "resourceID")
@@ -319,5 +321,7 @@ func (r *DynamicResourceReconciler) applyToRemote(ctx context.Context, remoteCli
 		client.ForceOwnership,
 		client.FieldOwner("krm-syncer"),
 	}
+	logger := log.FromContext(ctx)
+	logger.Info("Applying remote object", "object", remoteObj)
 	return remoteClient.Patch(ctx, remoteObj, client.Apply, patchOpts...)
 }
