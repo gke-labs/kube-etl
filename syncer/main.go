@@ -54,8 +54,6 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	var metricsAddr string
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	// Configure logging
 	klogFlagSet := goflag.NewFlagSet("klog", goflag.ExitOnError)
 	klog.InitFlags(klogFlagSet)
@@ -73,6 +71,7 @@ func run(ctx context.Context) error {
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
+		return err
 	}
 
 	// Create and set up the SyncerReconciler
@@ -83,11 +82,13 @@ func run(ctx context.Context) error {
 		Manager: mgr,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Syncer")
+		return err
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err = mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
+		return err
 	}
 	return nil
 }

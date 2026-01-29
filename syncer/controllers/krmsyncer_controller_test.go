@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package syncer
+package controllers
 
 import (
 	"context"
@@ -46,7 +46,7 @@ func TestSyncerSync(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	// Start Source Cluster
 	testEnvSource := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
 		DownloadBinaryAssets:  true,
 	}
@@ -55,7 +55,7 @@ func TestSyncerSync(t *testing.T) {
 
 	// Start Destination Cluster
 	testEnvDest := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
 		DownloadBinaryAssets:  true,
 	}

@@ -39,22 +39,12 @@ type DestinationConfig struct {
 	// +optional
 	// ClusterConfig defines the configuration for syncing to a remote Kubernetes cluster.
 	ClusterConfig *ClusterConfig `json:"clusterConfig,omitempty"`
-	// +optional
-	// GCSBucketConfig defines the configuration for syncing to a Google Cloud Storage bucket.
-	GCSBucketConfig *GCSBucketConfig `json:"gcsBucketConfig,omitempty"`
 }
 
 type ClusterConfig struct {
 	// KubeConfigSecretRef is the reference to the secret containing the
 	// kubeconfig of the destination cluster.
 	KubeConfigSecretRef *corev1.SecretReference `json:"kubeConfigSecretRef"`
-}
-
-type GCSBucketConfig struct {
-	// InstallationName is the name of the installation, used as a prefix in the GCS bucket path.
-	InstallationName string `json:"installationName"`
-	// GCSBucketName is the name of the Google Cloud Storage bucket where resources will be stored.
-	GCSBucketName string `json:"gcsBucketName"`
 }
 
 // KRMSyncerSpec defines the desired state.

@@ -64,22 +64,6 @@ spec:
                     required:
                     - kubeConfigSecretRef
                     type: object
-                  gcsBucketConfig:
-                    description: GCSBucketConfig defines the configuration for syncing
-                      to a Google Cloud Storage bucket.
-                    properties:
-                      gcsBucketName:
-                        description: GCSBucketName is the name of the Google Cloud
-                          Storage bucket where resources will be stored.
-                        type: string
-                      installationName:
-                        description: InstallationName is the name of the installation,
-                          used as a prefix in the GCS bucket path.
-                        type: string
-                    required:
-                    - gcsBucketName
-                    - installationName
-                    type: object
                 type: object
               rules:
                 description: Rules defines which resources to watch and sync. If unset,

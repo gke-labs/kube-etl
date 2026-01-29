@@ -46,7 +46,7 @@ generate:
 
 .PHONY: test-integration
 test-integration: manifests generate
-	go test -v ./test/integration/...
+	go test -v ./controllers/...
 
 ##@ Optional Integration Tests via Kind (Requires Kubeconfig)
 #.PHONY: kind-up-all

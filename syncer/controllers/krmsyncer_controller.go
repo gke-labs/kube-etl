@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package syncer
+package controllers
 
 import (
 	"context"
@@ -21,7 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sync"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -47,8 +46,7 @@ type KRMSyncerReconciler struct {
 
 //+kubebuilder:rbac:groups=syncer.gkelabs.io,resources=krmsyncers,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=syncer.gkelabs.io,resources=krmsyncers/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+//+kubebuilder:rbac:groups=*,resources=*,verbs=get;list;watch
 
 func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -75,12 +73,12 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		})
 		// Wait for the source cluster to push resources to us.
 		logger.Info("Sync suspended. Waiting for updates from active cluster...")
-		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+		return ctrl.Result{}, nil
 	}
 
 	meta.SetStatusCondition(&krmSyncer.Status.Conditions, metav1.Condition{
 		Type:    "Active",
-		Status:  metav1.ConditionFalse,
+		Status:  metav1.ConditionTrue,
 		Reason:  "Active",
 		Message: "Controller is active",
 	})
@@ -88,25 +86,26 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return r.reconcile(ctx, &krmSyncer)
 }
 
-func (r *KRMSyncerReconciler) reconcile(ctx context.Context, syncer *krmv1alpha1.KRMSyncer) (ctrl.Result, error) {
-	// logger := log.FromContext(ctx)
+func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for _, rule := range syncer.Spec.Rules {
+	for _, rule := range krmsyncer.Spec.Rules {
 		gvk := schema.GroupVersionKind{
 			Group:   rule.Group,
 			Version: rule.Version,
 			Kind:    rule.Kind,
 		}
 
+		// TODO: Implement watcher cleanup. Currently, watchers are never stopped even if the rule is removed.                                                                   │
+		// This can lead to "zombie" watchers and memory leaks.
 		if !r.WatchedGVKs[gvk] {
 			if err := r.startWatcher(ctx, gvk); err != nil {
-				// log.Log.Error(err, "Failed to start watcher for GVK", "gvk", gvk)
+				logger.Error(err, "Failed to start watcher for GVK", "gvk", gvk)
 				continue
 			}
-
 			r.WatchedGVKs[gvk] = true
 		}
 	}
@@ -123,6 +122,8 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(gvk)
 
+	// todo: Ensure controller name is unique and valid.
+	// e.g. It doesn't exceed length limits for very long GVK names.
 	return ctrl.NewControllerManagedBy(r.Manager).
 		For(u).
 		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
@@ -159,17 +160,17 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Fetch all Syncers to find matching rules (Active ones)
-	var syncers krmv1alpha1.KRMSyncerList
-	if err := r.List(ctx, &syncers); err != nil {
+	var krmsyncers krmv1alpha1.KRMSyncerList
+	if err := r.List(ctx, &krmsyncers); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	for _, syncer := range syncers.Items {
-		if syncer.Spec.Suspend {
+	for _, krmsyncer := range krmsyncers.Items {
+		if krmsyncer.Spec.Suspend {
 			continue
 		}
 
-		for _, rule := range syncer.Spec.Rules {
+		for _, rule := range krmsyncer.Spec.Rules {
 			// Check GVK match
 			if rule.Group != r.GVK.Group || rule.Version != r.GVK.Version || rule.Kind != r.GVK.Kind {
 				continue
@@ -179,7 +180,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if len(rule.Namespaces) > 0 {
 				matched := false
 				for _, ns := range rule.Namespaces {
-					if ns == "*" || ns == req.Namespace {
+					if ns == req.Namespace {
 						matched = true
 						break
 					}
@@ -190,8 +191,9 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			// Get Remote Client
-			remoteClient, err := r.getRemoteClient(ctx, &syncer)
+			remoteClient, err := r.getRemoteClient(ctx, &krmsyncer)
 			if err != nil {
+				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to get remote client")
 				continue
 			}
@@ -206,6 +208,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				logger.Info("Deleting resource on remote cluster", "name", req.Name, "namespace", req.Namespace)
 				if err := remoteClient.Delete(ctx, toDelete); err != nil {
 					if !errors.IsNotFound(err) {
+						// TODO: report failure in syncer status
 						logger.Error(err, "Failed to delete resource on remote cluster")
 					}
 				}
@@ -220,9 +223,10 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			remoteObj.SetResourceVersion("")
 			remoteObj.SetUID("")
 			remoteObj.SetGeneration(0)
-			// TODO: filter status, managedFields?
+			remoteObj.SetManagedFields(nil)
 
 			if err := r.applyToRemote(ctx, remoteClient, remoteObj); err != nil {
+				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to apply to remote cluster")
 			} else {
 				logger.Info("Successfully synced resource to remote cluster", "name", u.GetName(), "namespace", u.GetNamespace())
@@ -232,15 +236,15 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	return ctrl.Result{}, nil
 }
 
-func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, syncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
-	if syncer.Spec.Destination == nil || syncer.Spec.Destination.ClusterConfig == nil || syncer.Spec.Destination.ClusterConfig.KubeConfigSecretRef == nil {
+func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
+	if krmsyncer.Spec.Destination == nil || krmsyncer.Spec.Destination.ClusterConfig == nil || krmsyncer.Spec.Destination.ClusterConfig.KubeConfigSecretRef == nil {
 		return nil, fmt.Errorf("KubeConfigSecretRef not specified")
 	}
 
 	secret := &corev1.Secret{}
 	key := client.ObjectKey{
-		Name:      syncer.Spec.Destination.ClusterConfig.KubeConfigSecretRef.Name,
-		Namespace: syncer.Namespace, // Secret must be in the same namespace as Syncer
+		Name:      krmsyncer.Spec.Destination.ClusterConfig.KubeConfigSecretRef.Name,
+		Namespace: krmsyncer.Namespace, // Secret must be in the same namespace as Syncer
 	}
 	if err := r.Get(ctx, key, secret); err != nil {
 		return nil, err
@@ -260,18 +264,11 @@ func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, syncer 
 }
 
 func (r *DynamicResourceReconciler) applyToRemote(ctx context.Context, remoteClient client.Client, obj *unstructured.Unstructured) error {
-	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(obj.GroupVersionKind())
-	key := client.ObjectKeyFromObject(obj)
-
-	if err := remoteClient.Get(ctx, key, existing); err != nil {
-		if errors.IsNotFound(err) {
-			return remoteClient.Create(ctx, obj)
-		}
-		return err
+	// Use Server-Side Apply (SSA) to create or update the resource.
+	// This reduces round-trips (no need for Get) and handles conflicts gracefully.
+	patchOpts := []client.PatchOption{
+		client.ForceOwnership,
+		client.FieldOwner("krm-syncer"),
 	}
-
-	obj.SetResourceVersion(existing.GetResourceVersion())
-	obj.SetUID(existing.GetUID())
-	return remoteClient.Update(ctx, obj)
+	return remoteClient.Patch(ctx, obj, client.Apply, patchOpts...)
 }
