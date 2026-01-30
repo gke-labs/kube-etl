@@ -17,37 +17,27 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"strings"
+	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/source"
-
-	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 )
 
 // KRMSyncerReconciler reconciles a KRMSyncer object
 type KRMSyncerReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Cache  cache.Cache
-
-	// Ctrl is the controller interface to add watches dynamically
-	Ctrl controller.Controller
+	Scheme  *runtime.Scheme
+	Manager ctrl.Manager
 
 	// WatchedGVKs tracks which GVKs are already being watched
 	WatchedGVKs map[schema.GroupVersionKind]bool
@@ -56,8 +46,7 @@ type KRMSyncerReconciler struct {
 
 //+kubebuilder:rbac:groups=syncer.gkelabs.io,resources=krmsyncers,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=syncer.gkelabs.io,resources=krmsyncers/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+//+kubebuilder:rbac:groups=*,resources=*,verbs=get;list;watch
 
 func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -82,51 +71,41 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			Reason:  "SuspendedBySpec",
 			Message: "Controller is suspended",
 		})
-		logger.Info("KRMSyncer is suspended", "name", krmSyncer.Name)
+		// Wait for the source cluster to push resources to us.
+		logger.Info("Sync suspended. Waiting for updates from active cluster...")
 		return ctrl.Result{}, nil
 	}
 
 	meta.SetStatusCondition(&krmSyncer.Status.Conditions, metav1.Condition{
-		Type:    "Suspended",
-		Status:  metav1.ConditionFalse,
+		Type:    "Active",
+		Status:  metav1.ConditionTrue,
 		Reason:  "Active",
 		Message: "Controller is active",
 	})
+	logger.Info("Syncing updates from active cluster...")
+	return r.reconcile(ctx, &krmSyncer)
+}
 
-	// Dynamic Watch Registration
+func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for _, rule := range krmSyncer.Spec.Rules {
+	for _, rule := range krmsyncer.Spec.Rules {
 		gvk := schema.GroupVersionKind{
 			Group:   rule.Group,
 			Version: rule.Version,
 			Kind:    rule.Kind,
 		}
 
+		// TODO: Implement watcher cleanup. Currently, watchers are never stopped even if the rule is removed.                                                                   │
+		// This can lead to "zombie" watchers and memory leaks.
 		if !r.WatchedGVKs[gvk] {
-			logger.Info("Adding watch for GVK", "gvk", gvk)
-
-			// Create a generic object for that GVK
-			u := &unstructured.Unstructured{}
-			u.SetGroupVersionKind(gvk)
-
-			// Create the handler
-			// We use a custom EventHandler that handles the sync
-			h := &SyncHandler{
-				Client: r.Client,
-				GVK:    gvk,
-			}
-
-			// Call controller.Watch
-			// We watch the unstructured object type
-			err := r.Ctrl.Watch(source.Kind(r.Cache, u, h))
-			if err != nil {
-				logger.Error(err, "Failed to watch GVK", "gvk", gvk)
-				// Continue or return error? For MVP, log and continue.
+			if err := r.startWatcher(ctx, gvk); err != nil {
+				logger.Error(err, "Failed to start watcher for GVK", "gvk", gvk)
 				continue
 			}
-
 			r.WatchedGVKs[gvk] = true
 		}
 	}
@@ -134,197 +113,162 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.GroupVersionKind) error {
+	dr := &DynamicResourceReconciler{
+		Client: r.Client,
+		GVK:    gvk,
+	}
+
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvk)
+
+	// todo: Ensure controller name is unique and valid.
+	// e.g. It doesn't exceed length limits for very long GVK names.
+	return ctrl.NewControllerManagedBy(r.Manager).
+		For(u).
+		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
+		Complete(dr)
+}
+
 func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
-
-	// Build the controller
-	c, err := ctrl.NewControllerManagedBy(mgr).
+	return ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
-		Build(r)
+		Complete(r)
+}
 
+// DynamicResourceReconciler handles events for dynamically watched resources
+type DynamicResourceReconciler struct {
+	client.Client
+	GVK schema.GroupVersionKind
+}
+
+func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// Fetch the resource
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(r.GVK)
+	err := r.Get(ctx, req.NamespacedName, u)
+	isDeleted := false
 	if err != nil {
-		return err
+		if client.IgnoreNotFound(err) == nil {
+			isDeleted = true
+		} else {
+			return ctrl.Result{}, err
+		}
 	}
 
-	r.Ctrl = c
-	return nil
-}
-
-// SyncHandler handles events for dynamically watched resources
-type SyncHandler struct {
-	Client client.Client
-	GVK    schema.GroupVersionKind
-}
-
-func (h *SyncHandler) Create(ctx context.Context, e event.TypedCreateEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
-	h.handle(ctx, e.Object)
-}
-
-func (h *SyncHandler) Update(ctx context.Context, e event.TypedUpdateEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
-	h.handle(ctx, e.ObjectNew)
-}
-
-func (h *SyncHandler) Delete(ctx context.Context, e event.TypedDeleteEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
-	// MVP: No delete sync mandated, but good practice. Skipping for now as per "Sync resources from Local...".
-}
-
-func (h *SyncHandler) Generic(ctx context.Context, e event.TypedGenericEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
-	h.handle(ctx, e.Object)
-}
-
-func (h *SyncHandler) handle(ctx context.Context, obj client.Object) {
-	logger := log.FromContext(ctx).WithValues("gvk", h.GVK, "namespace", obj.GetNamespace(), "name", obj.GetName())
-
-	// Find KRMSyncer(s) that match this object
-	krmSyncerList := &krmv1alpha1.KRMSyncerList{}
-	if err := h.Client.List(ctx, krmSyncerList); err != nil {
-		logger.Error(err, "Failed to list KRMSyncers")
-		return
+	// Fetch all Syncers to find matching rules (Active ones)
+	var krmsyncers krmv1alpha1.KRMSyncerList
+	if err := r.List(ctx, &krmsyncers); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	for _, syncer := range krmSyncerList.Items {
-		if syncer.Spec.Suspend {
+	for _, krmsyncer := range krmsyncers.Items {
+		if krmsyncer.Spec.Suspend {
 			continue
 		}
 
-		matches := false
-		for _, rule := range syncer.Spec.Rules {
-			if rule.Group == h.GVK.Group && rule.Version == h.GVK.Version && rule.Kind == h.GVK.Kind {
-				// Check Namespace filter
-				if len(rule.Namespaces) > 0 {
-					nsMatch := false
-					for _, ns := range rule.Namespaces {
-						if ns == obj.GetNamespace() {
-							nsMatch = true
-							break
-						}
-					}
-					if !nsMatch {
-						continue
+		for _, rule := range krmsyncer.Spec.Rules {
+			// Check GVK match
+			if rule.Group != r.GVK.Group || rule.Version != r.GVK.Version || rule.Kind != r.GVK.Kind {
+				continue
+			}
+
+			// Check Namespace match
+			if len(rule.Namespaces) > 0 {
+				matched := false
+				for _, ns := range rule.Namespaces {
+					if ns == req.Namespace {
+						matched = true
+						break
 					}
 				}
-				matches = true
-				break
+				if !matched {
+					continue
+				}
 			}
-		}
 
-		if matches {
-			// Perform Sync
-			err := h.syncResource(ctx, &syncer, obj)
+			// Get Remote Client
+			remoteClient, err := r.getRemoteClient(ctx, &krmsyncer)
 			if err != nil {
-				logger.Error(err, "Failed to sync resource", "syncer", syncer.Name)
+				// TODO: report failure in syncer status
+				logger.Error(err, "Failed to get remote client")
+				continue
+			}
+
+			// Handle Deletion
+			if isDeleted {
+				toDelete := &unstructured.Unstructured{}
+				toDelete.SetGroupVersionKind(r.GVK)
+				toDelete.SetName(req.Name)
+				toDelete.SetNamespace(req.Namespace)
+
+				logger.Info("Deleting resource on remote cluster", "name", req.Name, "namespace", req.Namespace)
+				if err := remoteClient.Delete(ctx, toDelete); err != nil {
+					if !errors.IsNotFound(err) {
+						// TODO: report failure in syncer status
+						logger.Error(err, "Failed to delete resource on remote cluster")
+					}
+				}
+				continue
+			}
+
+			// Sync to Remote Cluster
+			logger.Info("Syncing resource to remote cluster", "name", u.GetName(), "namespace", u.GetNamespace())
+			remoteObj := u.DeepCopy()
+			// Prepare object for remote: clear ResourceVersion, UID, etc.
+			// Example error: "resourceVersion should not be set on objects to be created".
+			remoteObj.SetResourceVersion("")
+			remoteObj.SetUID("")
+			remoteObj.SetGeneration(0)
+			remoteObj.SetManagedFields(nil)
+
+			if err := r.applyToRemote(ctx, remoteClient, remoteObj); err != nil {
+				// TODO: report failure in syncer status
+				logger.Error(err, "Failed to apply to remote cluster")
 			} else {
-				logger.Info("Successfully synced resource", "syncer", syncer.Name)
+				logger.Info("Successfully synced resource to remote cluster", "name", u.GetName(), "namespace", u.GetNamespace())
 			}
 		}
 	}
+	return ctrl.Result{}, nil
 }
 
-func (h *SyncHandler) syncResource(ctx context.Context, syncer *krmv1alpha1.KRMSyncer, sourceObj client.Object) error {
-	// Get Destination Config
-	if syncer.Spec.Destination.KubeConfigSecretRef == nil {
-		return fmt.Errorf("destination kubeconfig secret ref is nil")
+func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
+	if krmsyncer.Spec.Destination == nil || krmsyncer.Spec.Destination.ClusterConfig == nil || krmsyncer.Spec.Destination.ClusterConfig.KubeConfigSecretRef == nil {
+		return nil, fmt.Errorf("KubeConfigSecretRef not specified")
 	}
 
-	secretRef := syncer.Spec.Destination.KubeConfigSecretRef
 	secret := &corev1.Secret{}
-	err := h.Client.Get(ctx, client.ObjectKey{Namespace: secretRef.Namespace, Name: secretRef.Name}, secret)
-	if err != nil {
-		return fmt.Errorf("failed to get kubeconfig secret: %w", err)
+	key := client.ObjectKey{
+		Name:      krmsyncer.Spec.Destination.ClusterConfig.KubeConfigSecretRef.Name,
+		Namespace: krmsyncer.Namespace, // Secret must be in the same namespace as Syncer
+	}
+	if err := r.Get(ctx, key, secret); err != nil {
+		return nil, err
 	}
 
-	kubeConfigData, ok := secret.Data["kubeconfig"] // Assuming key is 'kubeconfig'
+	kubeconfig, ok := secret.Data["kubeconfig"]
 	if !ok {
-		// Fallback to standard keys like 'config' or check if there is only one key
-		if v, ok := secret.Data["config"]; ok {
-			kubeConfigData = v
-		} else {
-			return fmt.Errorf("secret does not contain 'kubeconfig' or 'config' key")
-		}
+		return nil, fmt.Errorf("secret %s does not contain 'kubeconfig' key", key.Name)
 	}
 
-	// Create Dynamic Client
-	clientConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeConfigData)
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
-		return fmt.Errorf("failed to create rest config from secret: %w", err)
+		return nil, err
 	}
 
-	dynClient, err := dynamic.NewForConfig(clientConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create dynamic client: %w", err)
-	}
-
-	// Prepare Source Object
-	uObj, ok := sourceObj.(*unstructured.Unstructured)
-	if !ok {
-		// Convert if it's a typed object (though we watch unstructured, so it should be unstructured)
-		// But client.Object interface implementation might be typed?
-		// Since we used u.SetGroupVersionKind(gvk) in Watch, it should come as Unstructured if using dynamic cache or unstructured scheme?
-		// Wait, we passed `source.Kind(r.Client.Cache(), u)`. The cache usually returns what's in the scheme.
-		// If the Scheme has typed objects, it returns typed.
-		// `r.Client` uses the manager's scheme.
-		// `r.Scheme` (manager's scheme) likely has core types registered.
-
-		// If we receive a typed object, we need to convert to Unstructured to strip fields easily.
-		uObj = &unstructured.Unstructured{}
-
-		// Use runtime converter
-		unc, err := runtime.DefaultUnstructuredConverter.ToUnstructured(sourceObj)
-		if err != nil {
-			return fmt.Errorf("failed to convert to unstructured: %w", err)
-		}
-		uObj.SetUnstructuredContent(unc)
-		uObj.SetGroupVersionKind(sourceObj.GetObjectKind().GroupVersionKind())
-	}
-
-	// Sanitize
-	targetObj := uObj.DeepCopy()
-	targetObj.SetUID("")
-	targetObj.SetResourceVersion("")
-	targetObj.SetGeneration(0)
-	targetObj.SetOwnerReferences(nil)
-	targetObj.SetManagedFields(nil)
-
-	if syncer.Spec.Destination.Namespace != "" {
-		targetObj.SetNamespace(syncer.Spec.Destination.Namespace)
-	}
-
-	// Apply to Destination
-	gvr := schema.GroupVersionResource{
-		Group:    h.GVK.Group,
-		Version:  h.GVK.Version,
-		Resource: getResourceName(h.GVK.Kind), // Fallback
-	}
-
-	// Use the Source Cluster's RESTMapper to find the GVR.
-	// We assume Source and Destination have same API definitions for the watched resources.
-	mapping, err := h.Client.RESTMapper().RESTMapping(h.GVK.GroupKind(), h.GVK.Version)
-	if err != nil {
-		return fmt.Errorf("failed to get REST mapping: %w", err)
-	}
-	gvr = mapping.Resource
-
-	// Sync: Get Source Object -> Sanitize -> Apply to Destination.
-	_, err = dynClient.Resource(gvr).Namespace(targetObj.GetNamespace()).Apply(ctx, targetObj.GetName(), targetObj, metav1.ApplyOptions{FieldManager: "krmsyncer", Force: true})
-
-	if err != nil {
-		return fmt.Errorf("failed to apply resource: %w", err)
-	}
-
-	// Status Sync: Explicitly sync the status subresource if the object has one.
-	if _, ok := targetObj.Object["status"]; ok {
-		_, err = dynClient.Resource(gvr).Namespace(targetObj.GetNamespace()).Apply(ctx, targetObj.GetName(), targetObj, metav1.ApplyOptions{FieldManager: "krmsyncer", Force: true}, "status")
-		if err != nil {
-			// We log and return error, but it might fail if status subresource is not enabled.
-			// For MVP we assume if status is present, we should sync it.
-			return fmt.Errorf("failed to apply status: %w", err)
-		}
-	}
-
-	return nil
+	return client.New(restConfig, client.Options{})
 }
 
-func getResourceName(kind string) string {
-	return strings.ToLower(kind) + "s"
+func (r *DynamicResourceReconciler) applyToRemote(ctx context.Context, remoteClient client.Client, obj *unstructured.Unstructured) error {
+	// Use Server-Side Apply (SSA) to create or update the resource.
+	// This reduces round-trips (no need for Get) and handles conflicts gracefully.
+	patchOpts := []client.PatchOption{
+		client.ForceOwnership,
+		client.FieldOwner("krm-syncer"),
+	}
+	return remoteClient.Patch(ctx, obj, client.Apply, patchOpts...)
 }

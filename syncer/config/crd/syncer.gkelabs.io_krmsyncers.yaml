@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.14.0
+    controller-gen.kubebuilder.io/version: v0.20.0
   name: krmsyncers.syncer.gkelabs.io
 spec:
   group: syncer.gkelabs.io
@@ -42,45 +42,50 @@ spec:
               destination:
                 description: Destination defines the target for the sync.
                 properties:
-                  kubeConfigSecretRef:
-                    description: |-
-                      KubeConfigSecretRef is the reference to the secret containing the
-                      kubeconfig of the destination cluster.
+                  clusterConfig:
+                    description: ClusterConfig defines the configuration for syncing
+                      to a remote Kubernetes cluster.
                     properties:
-                      name:
-                        description: name is unique within a namespace to reference
-                          a secret resource.
-                        type: string
-                      namespace:
-                        description: namespace defines the space within which the
-                          secret name must be unique.
-                        type: string
+                      kubeConfigSecretRef:
+                        description: |-
+                          KubeConfigSecretRef is the reference to the secret containing the
+                          kubeconfig of the destination cluster.
+                        properties:
+                          name:
+                            description: name is unique within a namespace to reference
+                              a secret resource.
+                            type: string
+                          namespace:
+                            description: namespace defines the space within which
+                              the secret name must be unique.
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    required:
+                    - kubeConfigSecretRef
                     type: object
-                    x-kubernetes-map-type: atomic
-                  namespace:
-                    description: |-
-                      Namespace defines the target namespace to sync resources to.
-                      If not specified, the resource is synced to the same namespace as the source.
-                    type: string
                 type: object
               rules:
-                description: Rules defines which resources to watch and sync.
+                description: Rules defines which resources to watch and sync. If unset,
+                  sync all resources by default.
                 items:
                   description: ResourceRule defines criteria for what to sync.
                   properties:
                     group:
-                      description: Group is the API group of the resource
+                      description: Group is the API group of the resource to be synchronized.
                       type: string
                     kind:
-                      description: Kind is the Kind of the resource
+                      description: Kind is the Kind of the resource to be synchronized.
                       type: string
                     namespaces:
-                      description: Namespaces to filter source objects.
+                      description: Namespaces is an optional list of namespaces to
+                        watch. If not provided, all namespaces are synchronized.
                       items:
                         type: string
                       type: array
                     version:
-                      description: Version is the API version of the resource
+                      description: Version is the API version of the resource to be
+                        synchronized.
                       type: string
                   required:
                   - group
@@ -99,19 +104,10 @@ spec:
             description: KRMSyncerStatus defines the observed state.
             properties:
               conditions:
-                description: Conditions of the Syncer (e.g., DestinationUnreachable,
-                  Suspended).
+                description: Conditions of the Syncer.
                 items:
-                  description: "Condition contains details for one aspect of the current
-                    state of this API Resource.\n---\nThis struct is intended for
-                    direct use as an array at the field path .status.conditions.  For
-                    example,\n\n\n\ttype FooStatus struct{\n\t    // Represents the
-                    observations of a foo's current state.\n\t    // Known .status.conditions.type
-                    are: \"Available\", \"Progressing\", and \"Degraded\"\n\t    //
-                    +patchMergeKey=type\n\t    // +patchStrategy=merge\n\t    // +listType=map\n\t
-                    \   // +listMapKey=type\n\t    Conditions []metav1.Condition `json:\"conditions,omitempty\"
-                    patchStrategy:\"merge\" patchMergeKey:\"type\" protobuf:\"bytes,1,rep,name=conditions\"`\n\n\n\t
-                    \   // other fields\n\t}"
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
                   properties:
                     lastTransitionTime:
                       description: |-
@@ -152,12 +148,7 @@ spec:
                       - Unknown
                       type: string
                     type:
-                      description: |-
-                        type of condition in CamelCase or in foo.example.com/CamelCase.
-                        ---
-                        Many .condition.type values are consistent across resources like Available, but because arbitrary conditions can be
-                        useful (see .node.status.conditions), the ability to deconflict is important.
-                        The regex it matches is (dns1123SubdomainFmt/)?(qualifiedNameFmt)
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
                       maxLength: 316
                       pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
                       type: string
