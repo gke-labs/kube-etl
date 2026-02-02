@@ -1,6 +1,8 @@
 module github.com/gke-labs/kube-etl
 
-go 1.25.6
+go 1.24.0
+
+toolchain go1.24.12
 
 require (
 	github.com/spf13/cobra v1.9.1
