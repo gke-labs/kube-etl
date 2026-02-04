@@ -38,6 +38,7 @@ type KRMSyncerReconciler struct {
 	client.Client
 	Scheme  *runtime.Scheme
 	Manager ctrl.Manager
+	Name    string
 
 	// WatchedGVKs tracks which GVKs are already being watched
 	WatchedGVKs map[schema.GroupVersionKind]bool
@@ -132,8 +133,13 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 
 func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
+	name := "krmsyncer"
+	if r.Name != "" {
+		name = r.Name
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
+		Named(name).
 		Complete(r)
 }
 
@@ -263,12 +269,83 @@ func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsync
 	return client.New(restConfig, client.Options{})
 }
 
-func (r *DynamicResourceReconciler) applyToRemote(ctx context.Context, remoteClient client.Client, obj *unstructured.Unstructured) error {
-	// Use Server-Side Apply (SSA) to create or update the resource.
-	// This reduces round-trips (no need for Get) and handles conflicts gracefully.
+func (r *DynamicResourceReconciler) applyToRemote(ctx context.Context, remoteClient client.Client, remoteObj *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+	gk := remoteObj.GroupVersionKind().GroupKind()
+
 	patchOpts := []client.PatchOption{
 		client.ForceOwnership,
 		client.FieldOwner("krm-syncer"),
 	}
-	return remoteClient.Patch(ctx, obj, client.Apply, patchOpts...)
+
+	/*
+		Special handling for unadoptable resources.
+		Set reconcile interval annotation to 0 to turn off reconciliation after syncing.
+		Reconciliation stops only when the interval is set to 0 and status is UpToDate.
+	*/
+	unadoptableAndUpToDate := UnadoptableGKs[gk] && isUpToDate(remoteObj)
+	var status interface{}
+	if unadoptableAndUpToDate {
+		status, _, _ = unstructured.NestedFieldCopy(remoteObj.Object, "status")
+		annotations := remoteObj.GetAnnotations()
+		if annotations == nil {
+			annotations = make(map[string]string)
+		}
+		annotations["cnrm.cloud.google.com/reconcile-interval-in-seconds"] = "0"
+		remoteObj.SetAnnotations(annotations)
+	}
+
+	// Use Server-Side Apply (SSA) to create or update the resource.
+	// This reduces round-trips (no need for Get) and handles conflicts gracefully.
+	logger.Info("Applying remote object", "gk", gk, "name", remoteObj.GetName())
+	if err := remoteClient.Patch(ctx, remoteObj, client.Apply, patchOpts...); err != nil {
+		return err
+	}
+
+	if unadoptableAndUpToDate {
+		logger.Info("Applying status for unadoptable resource", "gk", gk, "name", remoteObj.GetName())
+		statusObj := &unstructured.Unstructured{}
+		statusObj.SetGroupVersionKind(remoteObj.GroupVersionKind())
+		statusObj.SetName(remoteObj.GetName())
+		statusObj.SetNamespace(remoteObj.GetNamespace())
+		err := unstructured.SetNestedField(statusObj.Object, status, "status")
+		if err != nil {
+			return err
+		}
+
+		if err := remoteClient.Status().Patch(ctx, statusObj, client.Apply, client.FieldOwner("krm-syncer"), client.ForceOwnership); err != nil {
+			return fmt.Errorf("failed to patch status: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// todo: hard-code resources' gk for now
+// Full list can be found at https://docs.cloud.google.com/config-connector/docs/how-to/managing-deleting-resources#resources_that_cannot_be_acquired
+var UnadoptableGKs = map[schema.GroupKind]bool{
+	{Group: "dataflow.cnrm.cloud.google.com", Kind: "DataflowFlexTemplateJob"}: true,
+	{Group: "firestore.cnrm.cloud.google.com", Kind: "FirestoreIndex"}:         true,
+	{Group: "iam.cnrm.cloud.google.com", Kind: "IAMServiceAccountKey"}:         true,
+	// Fake GK added only for integration test
+	{Group: "e2e.gkelabs.io", Kind: "ResourceUnadoptable"}: true,
+}
+
+func isUpToDate(obj *unstructured.Unstructured) bool {
+	conditions, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	if err != nil || !found {
+		return false
+	}
+	for _, condition := range conditions {
+		conditionMap, ok := condition.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		status, _ := conditionMap["status"].(string)
+		reason, _ := conditionMap["reason"].(string)
+		if status == "True" && reason == "UpToDate" {
+			return true
+		}
+	}
+	return false
 }

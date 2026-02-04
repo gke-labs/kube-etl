@@ -19,6 +19,8 @@ import (
 	"fmt"
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 	"path/filepath"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -182,6 +184,150 @@ func TestSyncerSync(t *testing.T) {
 		return client.IgnoreNotFound(err) == nil && err != nil, nil
 	})
 	assert.NoError(t, err, "ConfigMap should be deleted from dest")
+}
+
+func TestSyncerSyncUnadoptableResource(t *testing.T) {
+	ctrl.SetLogger(klog.NewKlogr())
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Start Source Cluster
+	testEnvSource := &envtest.Environment{
+		CRDDirectoryPaths: []string{
+			filepath.Join("..", "config", "crd"),
+			filepath.Join("..", "test", "crd"),
+		},
+		ErrorIfCRDPathMissing: true,
+		DownloadBinaryAssets:  true,
+	}
+	cfgSource, err := testEnvSource.Start()
+	require.NoError(t, err)
+
+	// Start Destination Cluster
+	testEnvDest := &envtest.Environment{
+		CRDDirectoryPaths: []string{
+			filepath.Join("..", "config", "crd"),
+			filepath.Join("..", "test", "crd"),
+		},
+		ErrorIfCRDPathMissing: true,
+		DownloadBinaryAssets:  true,
+	}
+	cfgDest, err := testEnvDest.Start()
+	require.NoError(t, err)
+
+	defer func() {
+		cancel()
+		time.Sleep(100 * time.Millisecond)
+		require.NoError(t, testEnvSource.Stop())
+		require.NoError(t, testEnvDest.Stop())
+	}()
+
+	require.NoError(t, krmv1alpha1.AddToScheme(scheme.Scheme))
+
+	k8sClientSource, err := client.New(cfgSource, client.Options{Scheme: scheme.Scheme})
+	require.NoError(t, err)
+	k8sClientDest, err := client.New(cfgDest, client.Options{Scheme: scheme.Scheme})
+	require.NoError(t, err)
+
+	mgr, err := ctrl.NewManager(cfgSource, ctrl.Options{
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
+		},
+	})
+	require.NoError(t, err, "failed to create manager")
+
+	err = (&KRMSyncerReconciler{
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Manager: mgr,
+		Name:    "krmsyncer-unadoptable-test",
+	}).SetupWithManager(mgr)
+	require.NoError(t, err, "failed to setup controller")
+
+	go func() {
+		if err := mgr.Start(ctx); err != nil {
+			fmt.Printf("manager failed: %v\n", err)
+		}
+	}()
+
+	ns := "default"
+	secretName := "dest-kubeconfig"
+	syncerName := "test-syncer"
+	resourceName := "test-resource"
+
+	destKubeconfigContent, err := createKubeconfig(cfgDest)
+	require.NoError(t, err)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
+		Data:       map[string][]byte{"kubeconfig": destKubeconfigContent},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, secret))
+
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Suspend: false,
+			Destination: &krmv1alpha1.DestinationConfig{
+				ClusterConfig: &krmv1alpha1.ClusterConfig{
+					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
+				},
+			},
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "e2e.gkelabs.io", Version: "v1alpha1", Kind: "ResourceUnadoptable",
+					Namespaces: []string{ns},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+
+	// Create a mock unadoptable resource with "UpToDate" status in source
+	res := &unstructured.Unstructured{}
+	res.SetGroupVersionKind(schema.GroupVersionKind{Group: "e2e.gkelabs.io", Version: "v1alpha1", Kind: "ResourceUnadoptable"})
+	res.SetName(resourceName)
+	res.SetNamespace(ns)
+	res.Object["spec"] = map[string]interface{}{
+		"label": "value",
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, res))
+
+	// Set UpToDate condition in status
+	conditions := []interface{}{
+		map[string]interface{}{
+			"type":               "Ready",
+			"status":             "True",
+			"reason":             "UpToDate",
+			"message":            "Resource is up to date",
+			"lastTransitionTime": metav1.Now().Format(time.RFC3339),
+		},
+	}
+	require.NoError(t, unstructured.SetNestedSlice(res.Object, conditions, "status", "conditions"))
+	require.NoError(t, k8sClientSource.Status().Update(ctx, res))
+
+	// Verify the resource is synced to dest and has the reconcile-interval annotation set to "0"
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		destObj := &unstructured.Unstructured{}
+		destObj.SetGroupVersionKind(res.GroupVersionKind())
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: resourceName, Namespace: ns}, destObj)
+		if err != nil {
+			return false, nil
+		}
+
+		annotations := destObj.GetAnnotations()
+		if annotations == nil {
+			return false, nil
+		}
+
+		interval, ok := annotations["cnrm.cloud.google.com/reconcile-interval-in-seconds"]
+		if !ok || interval != "0" {
+			return false, nil
+		}
+
+		// Also check if status was synced
+		return isUpToDate(destObj), nil
+	})
+	assert.NoError(t, err, "Mocked unadoptable resource should be synced to dest")
 }
 
 func createKubeconfig(cfg *rest.Config) ([]byte, error) {
