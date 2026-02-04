@@ -4,11 +4,11 @@ ETL for kubernetes objects: extract objects via watch, polling or audit logs; tr
 
 ## Projects
 
-### [KRMSyncer](docs/syncer.md)
+### [KRMSyncer](syncer/README.md)
 
 A controller for unidirectional synchronization of Kubernetes resources (KRM) from a local (source) cluster to a remote (destination) cluster.
 
-See [docs/syncer.md](docs/syncer.md) for details.
+See [syncer/README.md](syncer/README.md) for details.
 
 ## Contributing
 
