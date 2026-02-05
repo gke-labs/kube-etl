@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.20.0
+    controller-gen.kubebuilder.io/version: v0.16.0
   name: krmsyncers.syncer.gkelabs.io
 spec:
   group: syncer.gkelabs.io
@@ -82,6 +82,28 @@ spec:
                         watch. If not provided, all namespaces are synchronized.
                       items:
                         type: string
+                      type: array
+                    transforms:
+                      description: Transforms defines a list of transformations to
+                        apply to the resource before syncing.
+                      items:
+                        description: Transformation defines a modification to be applied
+                          to a resource.
+                        properties:
+                          fieldPath:
+                            description: |-
+                              FieldPath is the JSON path to the field to be removed (e.g., "spec.resourceID").
+                              Required for RemoveField.
+                            type: string
+                          type:
+                            description: Type of transformation. currently only "RemoveField"
+                              is supported.
+                            enum:
+                            - RemoveField
+                            type: string
+                        required:
+                        - type
+                        type: object
                       type: array
                     version:
                       description: Version is the API version of the resource to be

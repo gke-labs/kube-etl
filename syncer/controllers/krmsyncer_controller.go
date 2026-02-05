@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/clientcmd"
+	"strings"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -225,6 +226,13 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			remoteObj.SetGeneration(0)
 			remoteObj.SetManagedFields(nil)
 
+			if len(rule.Transforms) > 0 {
+				if err := r.applyTransforms(remoteObj, rule.Transforms); err != nil {
+					logger.Error(err, "Failed to apply transforms", "transforms", rule.Transforms)
+					continue
+				}
+			}
+
 			if err := r.applyToRemote(ctx, remoteClient, remoteObj); err != nil {
 				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to apply to remote cluster")
@@ -234,6 +242,19 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *DynamicResourceReconciler) applyTransforms(obj *unstructured.Unstructured, transforms []krmv1alpha1.Transformation) error {
+	for _, t := range transforms {
+		if t.Type == "RemoveField" {
+			if t.FieldPath == "" {
+				continue
+			}
+			path := strings.Split(t.FieldPath, ".")
+			unstructured.RemoveNestedField(obj.Object, path...)
+		}
+	}
+	return nil
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {

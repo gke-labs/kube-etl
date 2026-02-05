@@ -31,6 +31,23 @@ type ResourceRule struct {
 	// Namespaces is an optional list of namespaces to watch. If not provided, all namespaces are synchronized.
 	// +optional
 	Namespaces []string `json:"namespaces,omitempty"`
+
+	// Transforms defines a list of transformations to apply to the resource before syncing.
+	// +optional
+	Transforms []Transformation `json:"transforms,omitempty"`
+}
+
+// Transformation defines a modification to be applied to a resource.
+// +kubebuilder:object:generate=true
+type Transformation struct {
+	// Type of transformation. currently only "RemoveField" is supported.
+	// +kubebuilder:validation:Enum=RemoveField
+	Type string `json:"type"`
+
+	// FieldPath is the JSON path to the field to be removed (e.g., "spec.resourceID").
+	// Required for RemoveField.
+	// +optional
+	FieldPath string `json:"fieldPath,omitempty"`
 }
 
 // DestinationConfig defines where to push resources.
