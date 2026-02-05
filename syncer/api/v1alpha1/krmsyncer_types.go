@@ -40,14 +40,20 @@ type ResourceRule struct {
 // Transformation defines a modification to be applied to a resource.
 // +kubebuilder:object:generate=true
 type Transformation struct {
-	// Type of transformation. currently only "RemoveField" is supported.
-	// +kubebuilder:validation:Enum=RemoveField
-	Type string `json:"type"`
-
-	// FieldPath is the JSON path to the field to be removed (e.g., "spec.resourceID").
-	// Required for RemoveField.
+	// ServiceGeneratedIDTransform allows mapping a value from a source field (e.g., status)
+	// to a destination field (e.g., spec) before syncing.
 	// +optional
-	FieldPath string `json:"fieldPath,omitempty"`
+	ServiceGeneratedIDTransform *ServiceGeneratedIDTransform `json:"serviceGeneratedIDTransform,omitempty"`
+}
+
+// ServiceGeneratedIDTransform defines the source and destination fields for the transformation.
+// +kubebuilder:object:generate=true
+type ServiceGeneratedIDTransform struct {
+	// Source is the JSON path to the field to copy the value from (e.g., "status.externalRef").
+	Source string `json:"source"`
+
+	// Destination is the JSON path to the field to set the value to (e.g., "spec.resourceID").
+	Destination string `json:"destination"`
 }
 
 // DestinationConfig defines where to push resources.

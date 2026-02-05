@@ -90,19 +90,23 @@ spec:
                         description: Transformation defines a modification to be applied
                           to a resource.
                         properties:
-                          fieldPath:
+                          serviceGeneratedIDTransform:
                             description: |-
-                              FieldPath is the JSON path to the field to be removed (e.g., "spec.resourceID").
-                              Required for RemoveField.
-                            type: string
-                          type:
-                            description: Type of transformation. currently only "RemoveField"
-                              is supported.
-                            enum:
-                            - RemoveField
-                            type: string
-                        required:
-                        - type
+                              ServiceGeneratedIDTransform allows mapping a value from a source field (e.g., status)
+                              to a destination field (e.g., spec) before syncing.
+                            properties:
+                              destination:
+                                description: Destination is the JSON path to the field
+                                  to set the value to (e.g., "spec.resourceID").
+                                type: string
+                              source:
+                                description: Source is the JSON path to the field
+                                  to copy the value from (e.g., "status.externalRef").
+                                type: string
+                            required:
+                            - destination
+                            - source
+                            type: object
                         type: object
                       type: array
                     version:

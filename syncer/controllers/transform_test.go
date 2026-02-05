@@ -118,8 +118,10 @@ func TestSyncerTransform(t *testing.T) {
 					Namespaces: []string{ns},
 					Transforms: []krmv1alpha1.Transformation{
 						{
-							Type:      "RemoveField",
-							FieldPath: "data.tempKey",
+							ServiceGeneratedIDTransform: &krmv1alpha1.ServiceGeneratedIDTransform{
+								Source:      "data.sourceKey",
+								Destination: "data.destKey",
+							},
 						},
 					},
 				},
@@ -128,10 +130,10 @@ func TestSyncerTransform(t *testing.T) {
 	}
 	require.NoError(t, k8sClientSource.Create(ctx, syncer))
 
-	// Create ConfigMap in Source with the field to be removed
+	// Create ConfigMap in Source with the source field
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: configMapName, Namespace: ns},
-		Data:       map[string]string{"keepKey": "keepValue", "tempKey": "removeValue"},
+		Data:       map[string]string{"sourceKey": "sourceValue"},
 	}
 	require.NoError(t, k8sClientSource.Create(ctx, cm))
 
@@ -143,18 +145,17 @@ func TestSyncerTransform(t *testing.T) {
 			return false, nil
 		}
 		
-		// Check if "keepKey" is present
-		if destCm.Data["keepKey"] != "keepValue" {
+		// Check if "sourceKey" is present (it should be copied as is because we didn't remove it)
+		if destCm.Data["sourceKey"] != "sourceValue" {
 			return false, nil
 		}
 		
-		// Check if "tempKey" is REMOVED
-		if _, ok := destCm.Data["tempKey"]; ok {
-			// Fail: tempKey should be removed
+		// Check if "destKey" is SET from "sourceKey"
+		if destCm.Data["destKey"] != "sourceValue" {
 			return false, nil
 		}
 		
 		return true, nil
 	})
-	assert.NoError(t, err, "ConfigMap should be synced to dest with tempKey removed")
+	assert.NoError(t, err, "ConfigMap should be synced to dest with destKey set from sourceKey")
 }

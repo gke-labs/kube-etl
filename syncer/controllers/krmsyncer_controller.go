@@ -246,12 +246,28 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 func (r *DynamicResourceReconciler) applyTransforms(obj *unstructured.Unstructured, transforms []krmv1alpha1.Transformation) error {
 	for _, t := range transforms {
-		if t.Type == "RemoveField" {
-			if t.FieldPath == "" {
+		if t.ServiceGeneratedIDTransform != nil {
+			src := t.ServiceGeneratedIDTransform.Source
+			dst := t.ServiceGeneratedIDTransform.Destination
+
+			if src == "" || dst == "" {
 				continue
 			}
-			path := strings.Split(t.FieldPath, ".")
-			unstructured.RemoveNestedField(obj.Object, path...)
+
+			srcPath := strings.Split(src, ".")
+			val, found, err := unstructured.NestedString(obj.Object, srcPath...)
+			if err != nil {
+				return fmt.Errorf("failed to get source field %s: %w", src, err)
+			}
+			if !found {
+				// Source field not found, skip this transform
+				continue
+			}
+
+			dstPath := strings.Split(dst, ".")
+			if err := unstructured.SetNestedField(obj.Object, val, dstPath...); err != nil {
+				return fmt.Errorf("failed to set destination field %s: %w", dst, err)
+			}
 		}
 	}
 	return nil
