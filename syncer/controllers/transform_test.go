@@ -22,24 +22,25 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/klog/v2"
+	"path/filepath"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"path/filepath"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"testing"
 	"time"
-	"k8s.io/klog/v2"
 )
 
 func TestSyncerTransform(t *testing.T) {
 	// Setup Logic
 	ctrl.SetLogger(klog.NewKlogr())
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	// Start Source Cluster
 	testEnvSource := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
@@ -76,11 +77,16 @@ func TestSyncerTransform(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = (&KRMSyncerReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Manager: mgr,
-	}).SetupWithManager(mgr)
+	r := &KRMSyncerReconciler{
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		Manager:     mgr,
+		WatchedGVKs: make(map[schema.GroupVersionKind]bool),
+	}
+	err = ctrl.NewControllerManagedBy(mgr).
+		For(&krmv1alpha1.KRMSyncer{}).
+		Named("krmsyncer-transform-test").
+		Complete(r)
 	require.NoError(t, err)
 
 	go func() {
@@ -144,17 +150,17 @@ func TestSyncerTransform(t *testing.T) {
 		if err != nil {
 			return false, nil
 		}
-		
+
 		// Check if "sourceKey" is present (it should be copied as is because we didn't remove it)
 		if destCm.Data["sourceKey"] != "sourceValue" {
 			return false, nil
 		}
-		
+
 		// Check if "destKey" is SET from "sourceKey"
 		if destCm.Data["destKey"] != "sourceValue" {
 			return false, nil
 		}
-		
+
 		return true, nil
 	})
 	assert.NoError(t, err, "ConfigMap should be synced to dest with destKey set from sourceKey")
