@@ -78,10 +78,11 @@ func TestSyncerTransform(t *testing.T) {
 	require.NoError(t, err)
 
 	r := &KRMSyncerReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		Manager:     mgr,
-		WatchedGVKs: make(map[schema.GroupVersionKind]bool),
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		Manager:              mgr,
+		WatchedGVKs:          make(map[schema.GroupVersionKind]bool),
+		ControllerNameSuffix: "transform-test",
 	}
 	err = ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
@@ -124,7 +125,7 @@ func TestSyncerTransform(t *testing.T) {
 					Namespaces: []string{ns},
 					Transforms: []krmv1alpha1.Transformation{
 						{
-							ServiceGeneratedIDTransform: &krmv1alpha1.ServiceGeneratedIDTransform{
+							FieldTransform: &krmv1alpha1.FieldTransform{
 								Source:      "data.sourceKey",
 								Destination: "data.destKey",
 							},

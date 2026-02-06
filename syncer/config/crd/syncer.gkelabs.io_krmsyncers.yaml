@@ -90,9 +90,9 @@ spec:
                         description: Transformation defines a modification to be applied
                           to a resource.
                         properties:
-                          serviceGeneratedIDTransform:
+                          fieldTransform:
                             description: |-
-                              ServiceGeneratedIDTransform allows mapping a value from a source field (e.g., status)
+                              FieldTransform allows mapping a value from a source field (e.g., status)
                               to a destination field (e.g., spec) before syncing.
                             properties:
                               destination:

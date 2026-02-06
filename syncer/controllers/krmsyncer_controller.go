@@ -43,6 +43,9 @@ type KRMSyncerReconciler struct {
 	// WatchedGVKs tracks which GVKs are already being watched
 	WatchedGVKs map[schema.GroupVersionKind]bool
 	mu          sync.RWMutex
+
+	// ControllerNameSuffix is used to make dynamic controller names unique (e.g. for tests)
+	ControllerNameSuffix string
 }
 
 //+kubebuilder:rbac:groups=syncer.gkelabs.io,resources=krmsyncers,verbs=get;list;watch;create;update;patch;delete
@@ -125,9 +128,14 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 
 	// todo: Ensure controller name is unique and valid.
 	// e.g. It doesn't exceed length limits for very long GVK names.
+	name := fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)
+	if r.ControllerNameSuffix != "" {
+		name += "-" + r.ControllerNameSuffix
+	}
+
 	return ctrl.NewControllerManagedBy(r.Manager).
 		For(u).
-		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
+		Named(name).
 		Complete(dr)
 }
 
@@ -246,9 +254,9 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 func (r *DynamicResourceReconciler) applyTransforms(obj *unstructured.Unstructured, transforms []krmv1alpha1.Transformation) error {
 	for _, t := range transforms {
-		if t.ServiceGeneratedIDTransform != nil {
-			src := t.ServiceGeneratedIDTransform.Source
-			dst := t.ServiceGeneratedIDTransform.Destination
+		if t.FieldTransform != nil {
+			src := t.FieldTransform.Source
+			dst := t.FieldTransform.Destination
 
 			if src == "" || dst == "" {
 				continue

@@ -40,15 +40,15 @@ type ResourceRule struct {
 // Transformation defines a modification to be applied to a resource.
 // +kubebuilder:object:generate=true
 type Transformation struct {
-	// ServiceGeneratedIDTransform allows mapping a value from a source field (e.g., status)
+	// FieldTransform allows mapping a value from a source field (e.g., status)
 	// to a destination field (e.g., spec) before syncing.
 	// +optional
-	ServiceGeneratedIDTransform *ServiceGeneratedIDTransform `json:"serviceGeneratedIDTransform,omitempty"`
+	FieldTransform *FieldTransform `json:"fieldTransform,omitempty"`
 }
 
-// ServiceGeneratedIDTransform defines the source and destination fields for the transformation.
+// FieldTransform defines the source and destination fields for the transformation.
 // +kubebuilder:object:generate=true
-type ServiceGeneratedIDTransform struct {
+type FieldTransform struct {
 	// Source is the JSON path to the field to copy the value from (e.g., "status.externalRef").
 	Source string `json:"source"`
 
