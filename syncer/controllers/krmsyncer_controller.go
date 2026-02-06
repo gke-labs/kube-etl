@@ -31,6 +31,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"strings"
 )
 
 // KRMSyncerReconciler reconciles a KRMSyncer object
@@ -42,6 +43,9 @@ type KRMSyncerReconciler struct {
 	// WatchedGVKs tracks which GVKs are already being watched
 	WatchedGVKs map[schema.GroupVersionKind]bool
 	mu          sync.RWMutex
+
+	// ControllerNameSuffix is used to make dynamic controller names unique (e.g. for tests)
+	ControllerNameSuffix string
 }
 
 //+kubebuilder:rbac:groups=syncer.gkelabs.io,resources=krmsyncers,verbs=get;list;watch;create;update;patch;delete
@@ -124,9 +128,14 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 
 	// todo: Ensure controller name is unique and valid.
 	// e.g. It doesn't exceed length limits for very long GVK names.
+	name := fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)
+	if r.ControllerNameSuffix != "" {
+		name += "-" + r.ControllerNameSuffix
+	}
+
 	return ctrl.NewControllerManagedBy(r.Manager).
 		For(u).
-		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
+		Named(name).
 		Complete(dr)
 }
 
@@ -225,6 +234,13 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			remoteObj.SetGeneration(0)
 			remoteObj.SetManagedFields(nil)
 
+			if len(rule.Transforms) > 0 {
+				if err := r.applyTransforms(remoteObj, rule.Transforms); err != nil {
+					logger.Error(err, "Failed to apply transforms", "transforms", rule.Transforms)
+					continue
+				}
+			}
+
 			if err := r.applyToRemote(ctx, remoteClient, remoteObj); err != nil {
 				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to apply to remote cluster")
@@ -234,6 +250,35 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *DynamicResourceReconciler) applyTransforms(obj *unstructured.Unstructured, transforms []krmv1alpha1.Transformation) error {
+	for _, t := range transforms {
+		if t.FieldTransform != nil {
+			src := t.FieldTransform.Source
+			dst := t.FieldTransform.Destination
+
+			if src == "" || dst == "" {
+				continue
+			}
+
+			srcPath := strings.Split(src, ".")
+			val, found, err := unstructured.NestedString(obj.Object, srcPath...)
+			if err != nil {
+				return fmt.Errorf("failed to get source field %s: %w", src, err)
+			}
+			if !found {
+				// Source field not found, skip this transform
+				continue
+			}
+
+			dstPath := strings.Split(dst, ".")
+			if err := unstructured.SetNestedField(obj.Object, val, dstPath...); err != nil {
+				return fmt.Errorf("failed to set destination field %s: %w", dst, err)
+			}
+		}
+	}
+	return nil
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
