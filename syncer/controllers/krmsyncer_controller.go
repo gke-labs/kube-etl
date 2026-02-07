@@ -20,6 +20,7 @@ import (
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -38,6 +39,7 @@ type KRMSyncerReconciler struct {
 	client.Client
 	Scheme  *runtime.Scheme
 	Manager ctrl.Manager
+	Name    string
 
 	// WatchedGVKs tracks which GVKs are already being watched
 	WatchedGVKs map[schema.GroupVersionKind]bool
@@ -132,8 +134,13 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 
 func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
+	name := "krmsyncer"
+	if r.Name != "" {
+		name = r.Name
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
+		Named(name).
 		Complete(r)
 }
 
@@ -263,12 +270,63 @@ func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsync
 	return client.New(restConfig, client.Options{})
 }
 
-func (r *DynamicResourceReconciler) applyToRemote(ctx context.Context, remoteClient client.Client, obj *unstructured.Unstructured) error {
+func (r *DynamicResourceReconciler) applyToRemote(ctx context.Context, remoteClient client.Client, remoteObj *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+	gvk := remoteObj.GroupVersionKind()
+
+	// Special handling for resources with service-generated resourceID
+	switch gvk.GroupKind() {
+	// todo: hard-code resources' gk for now
+	// Full list can be found at https://docs.cloud.google.com/config-connector/docs/how-to/managing-deleting-resources#service-generated-resource-id
+	case schema.GroupKind{Group: "accesscontextmanager.cnrm.cloud.google.com", Kind: "AccessContextManagerAccessPolicy"},
+		schema.GroupKind{Group: "alloydb.cnrm.cloud.google.com", Kind: "AlloyDBBackup"},
+		schema.GroupKind{Group: "apigee.cnrm.cloud.google.com", Kind: "ApigeeOrganization"},
+		schema.GroupKind{Group: "billingbudgets.cnrm.cloud.google.com", Kind: "BillingBudgetsBudget"},
+		schema.GroupKind{Group: "cloudidentity.cnrm.cloud.google.com", Kind: "CloudIdentityGroup"},
+		schema.GroupKind{Group: "dlp.cnrm.cloud.google.com", Kind: "DLPInspectTemplate"},
+		schema.GroupKind{Group: "dlp.cnrm.cloud.google.com", Kind: "DLPJobTrigger"},
+		schema.GroupKind{Group: "dlp.cnrm.cloud.google.com", Kind: "DLPStoredInfoType"},
+		schema.GroupKind{Group: "datacatalog.cnrm.cloud.google.com", Kind: "DataCatalogPolicyTag"},
+		schema.GroupKind{Group: "datacatalog.cnrm.cloud.google.com", Kind: "DataCatalogTaxonomy"},
+		schema.GroupKind{Group: "essentialcontacts.cnrm.cloud.google.com", Kind: "EssentialContactsContact"},
+		schema.GroupKind{Group: "resourcemanager.cnrm.cloud.google.com", Kind: "Folder"},
+		schema.GroupKind{Group: "iap.cnrm.cloud.google.com", Kind: "IAPBrand"},
+		schema.GroupKind{Group: "iap.cnrm.cloud.google.com", Kind: "IAPIdentityAwareProxyClient"},
+		schema.GroupKind{Group: "secretmanager.cnrm.cloud.google.com", Kind: "SecretManagerSecretVersion"},
+		schema.GroupKind{Group: "storage.cnrm.cloud.google.com", Kind: "StorageNotification"},
+		schema.GroupKind{Group: "storage.cnrm.cloud.google.com", Kind: "StorageTransferJob"},
+		schema.GroupKind{Group: "tags.cnrm.cloud.google.com", Kind: "TagsTagBinding"},
+		schema.GroupKind{Group: "tags.cnrm.cloud.google.com", Kind: "TagsTagKey"},
+		schema.GroupKind{Group: "tags.cnrm.cloud.google.com", Kind: "TagsTagValue"},
+		schema.GroupKind{Group: "vertexai.cnrm.cloud.google.com", Kind: "VertexAIDataset"},
+		schema.GroupKind{Group: "vertexai.cnrm.cloud.google.com", Kind: "VertexAIIndex"},
+		schema.GroupKind{Group: "e2e.gkelabs.io", Kind: "ResourceWithGeneratedID"}:
+		// Retrieve the service-generated resourceID from resource's spec.resourceID(legacy)
+		// or from status.externalRef(direct) and write back to spec.resourceID for acquisition.
+		resourceID, _, err := unstructured.NestedString(remoteObj.Object, "spec", "resourceID")
+		if err != nil {
+			return fmt.Errorf("reading spec.resourceID: %w", err)
+		}
+		if resourceID == "" {
+			externalRef, _, err := unstructured.NestedString(remoteObj.Object, "status", "externalRef")
+			if err != nil {
+				return fmt.Errorf("reading status.externalRef: %w", err)
+			}
+			tokens := strings.Split(externalRef, "/")
+			resourceID = tokens[len(tokens)-1]
+			err = unstructured.SetNestedField(remoteObj.Object, resourceID, "spec", "resourceID")
+			if err != nil {
+				return fmt.Errorf("setting spec.resourceID: %w", err)
+			}
+		}
+	default: // do nothing
+	}
 	// Use Server-Side Apply (SSA) to create or update the resource.
 	// This reduces round-trips (no need for Get) and handles conflicts gracefully.
 	patchOpts := []client.PatchOption{
 		client.ForceOwnership,
 		client.FieldOwner("krm-syncer"),
 	}
-	return remoteClient.Patch(ctx, obj, client.Apply, patchOpts...)
+	logger.Info("Applying remote object", "object", remoteObj)
+	return remoteClient.Patch(ctx, remoteObj, client.Apply, patchOpts...)
 }
