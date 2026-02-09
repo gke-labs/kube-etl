@@ -234,9 +234,9 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			remoteObj.SetGeneration(0)
 			remoteObj.SetManagedFields(nil)
 
-			if len(rule.Transforms) > 0 {
-				if err := r.applyTransforms(remoteObj, rule.Transforms); err != nil {
-					logger.Error(err, "Failed to apply transforms", "transforms", rule.Transforms)
+			if len(rule.Transform) > 0 {
+				if err := r.applyTransforms(remoteObj, rule.Transform); err != nil {
+					logger.Error(err, "Failed to apply transforms", "transforms", rule.Transform)
 					continue
 				}
 			}

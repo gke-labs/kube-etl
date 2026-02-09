@@ -39,7 +39,7 @@ import (
 func TestSyncerTransform(t *testing.T) {
 	// Setup Logic
 	ctrl.SetLogger(klog.NewKlogr())
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 
 	// Start Source Cluster
 	testEnvSource := &envtest.Environment{
@@ -123,7 +123,7 @@ func TestSyncerTransform(t *testing.T) {
 				{
 					Group: "", Version: "v1", Kind: "ConfigMap",
 					Namespaces: []string{ns},
-					Transforms: []krmv1alpha1.Transformation{
+					Transform: []krmv1alpha1.Transformation{
 						{
 							FieldTransform: &krmv1alpha1.FieldTransform{
 								Source:      "data.sourceKey",

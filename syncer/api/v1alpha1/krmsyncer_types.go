@@ -32,9 +32,9 @@ type ResourceRule struct {
 	// +optional
 	Namespaces []string `json:"namespaces,omitempty"`
 
-	// Transforms defines a list of transformations to apply to the resource before syncing.
+	// Transform defines a list of transformations to apply to the resource before syncing.
 	// +optional
-	Transforms []Transformation `json:"transforms,omitempty"`
+	Transform []Transformation `json:"transform,omitempty"`
 }
 
 // Transformation defines a modification to be applied to a resource.
