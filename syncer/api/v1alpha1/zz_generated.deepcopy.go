@@ -181,8 +181,8 @@ func (in *ResourceRule) DeepCopyInto(out *ResourceRule) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
-	if in.Transforms != nil {
-		in, out := &in.Transforms, &out.Transforms
+	if in.Transform != nil {
+		in, out := &in.Transform, &out.Transform
 		*out = make([]Transformation, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])

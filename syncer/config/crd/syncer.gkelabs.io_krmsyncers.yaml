@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.16.0
+    controller-gen.kubebuilder.io/version: v0.20.0
   name: krmsyncers.syncer.gkelabs.io
 spec:
   group: syncer.gkelabs.io
@@ -83,8 +83,8 @@ spec:
                       items:
                         type: string
                       type: array
-                    transforms:
-                      description: Transforms defines a list of transformations to
+                    transform:
+                      description: Transform defines a list of transformations to
                         apply to the resource before syncing.
                       items:
                         description: Transformation defines a modification to be applied
