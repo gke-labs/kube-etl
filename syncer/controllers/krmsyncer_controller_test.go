@@ -43,7 +43,7 @@ import (
 func TestSyncerSync(t *testing.T) {
 	// Setup Logic
 	ctrl.SetLogger(klog.NewKlogr())
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	// Start Source Cluster
 	testEnvSource := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},

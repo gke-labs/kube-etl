@@ -31,6 +31,35 @@ type ResourceRule struct {
 	// Namespaces is an optional list of namespaces to watch. If not provided, all namespaces are synchronized.
 	// +optional
 	Namespaces []string `json:"namespaces,omitempty"`
+
+	// Transform defines a list of transformations to apply to the resource before syncing.
+	// +optional
+	Transform []Transformation `json:"transform,omitempty"`
+}
+
+// Transformation defines a modification to be applied to a resource.
+// +kubebuilder:object:generate=true
+type Transformation struct {
+	// FieldTransform allows mapping a value from a source field (e.g., status)
+	// to a destination field (e.g., spec) before syncing.
+	// +optional
+	FieldTransform *FieldTransform `json:"fieldTransform,omitempty"`
+}
+
+// FieldTransform defines the source and destination fields for the transformation.
+// +kubebuilder:object:generate=true
+type FieldTransform struct {
+	// Source is the JSON path to the field to copy the value from (e.g., "status.externalRef").
+	Source string `json:"source"`
+
+	// Destination is the JSON path to the field to set the value to (e.g., "spec.resourceID").
+	Destination string `json:"destination"`
+
+	// ExtractRegex is an optional regular expression to extract a sub-string from the source field.
+	// If provided, the first capture group will be used as the value to set in the destination.
+	// Only applicable if the source field is a string.
+	// +optional
+	ExtractRegex string `json:"extractRegex,omitempty"`
 }
 
 // DestinationConfig defines where to push resources.

@@ -28,9 +28,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/clientcmd"
+	"regexp"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"strconv"
+	"strings"
 )
 
 // KRMSyncerReconciler reconciles a KRMSyncer object
@@ -42,6 +45,9 @@ type KRMSyncerReconciler struct {
 	// WatchedGVKs tracks which GVKs are already being watched
 	WatchedGVKs map[schema.GroupVersionKind]bool
 	mu          sync.RWMutex
+
+	// ControllerNameSuffix is used to make dynamic controller names unique (e.g. for tests)
+	ControllerNameSuffix string
 }
 
 //+kubebuilder:rbac:groups=syncer.gkelabs.io,resources=krmsyncers,verbs=get;list;watch;create;update;patch;delete
@@ -124,9 +130,14 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 
 	// todo: Ensure controller name is unique and valid.
 	// e.g. It doesn't exceed length limits for very long GVK names.
+	name := fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)
+	if r.ControllerNameSuffix != "" {
+		name += "-" + r.ControllerNameSuffix
+	}
+
 	return ctrl.NewControllerManagedBy(r.Manager).
 		For(u).
-		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
+		Named(name).
 		Complete(dr)
 }
 
@@ -225,6 +236,13 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			remoteObj.SetGeneration(0)
 			remoteObj.SetManagedFields(nil)
 
+			if len(rule.Transform) > 0 {
+				if err := r.applyTransforms(remoteObj, rule.Transform); err != nil {
+					logger.Error(err, "Failed to apply transforms", "transforms", rule.Transform)
+					continue
+				}
+			}
+
 			if err := r.applyToRemote(ctx, remoteClient, remoteObj); err != nil {
 				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to apply to remote cluster")
@@ -234,6 +252,103 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *DynamicResourceReconciler) applyTransforms(obj *unstructured.Unstructured, transforms []krmv1alpha1.Transformation) error {
+	for _, t := range transforms {
+		if t.FieldTransform != nil {
+			src := t.FieldTransform.Source
+			dst := t.FieldTransform.Destination
+			regex := t.FieldTransform.ExtractRegex
+
+			if src == "" || dst == "" {
+				continue
+			}
+
+			srcPath := strings.Split(src, ".")
+			val, found, err := unstructured.NestedFieldCopy(obj.Object, srcPath...)
+			if err != nil {
+				return fmt.Errorf("failed to get source field %s: %w", src, err)
+			}
+			if !found {
+				// Source field not found, skip this transform
+				continue
+			}
+
+			var finalVal interface{} = val
+			if regex != "" {
+				strVal, ok := val.(string)
+				if !ok {
+					return fmt.Errorf("source field %s is not a string, but ExtractRegex is provided", src)
+				}
+
+				re, err := regexp.Compile(regex)
+				if err != nil {
+					return fmt.Errorf("invalid regex %s: %w", regex, err)
+				}
+
+				matches := re.FindStringSubmatch(strVal)
+				if len(matches) < 2 {
+					return fmt.Errorf("regex %s did not match source field %s (value: %s) or no capture group found", regex, src, strVal)
+				}
+				finalVal = matches[1]
+			}
+
+			dstPath := strings.Split(dst, ".")
+
+			// Try to get existing destination value to determine target type
+			existingVal, found, err := unstructured.NestedFieldCopy(obj.Object, dstPath...)
+			if err == nil && found && existingVal != nil {
+				coercedVal, err := coerceType(finalVal, existingVal)
+				if err != nil {
+					return fmt.Errorf("failed to convert source value to match destination field %s type: %w", dst, err)
+				}
+				finalVal = coercedVal
+			}
+
+			if err := unstructured.SetNestedField(obj.Object, finalVal, dstPath...); err != nil {
+				return fmt.Errorf("failed to set destination field %s: %w", dst, err)
+			}
+		}
+	}
+	return nil
+}
+
+func coerceType(val interface{}, target interface{}) (interface{}, error) {
+	switch target.(type) {
+	case string:
+		return fmt.Sprintf("%v", val), nil
+	case int64:
+		switch v := val.(type) {
+		case int64:
+			return v, nil
+		case int:
+			return int64(v), nil
+		case float64:
+			return int64(v), nil
+		case string:
+			return strconv.ParseInt(v, 10, 64)
+		}
+	case bool:
+		switch v := val.(type) {
+		case bool:
+			return v, nil
+		case string:
+			return strconv.ParseBool(v)
+		}
+	case float64:
+		switch v := val.(type) {
+		case float64:
+			return v, nil
+		case int64:
+			return float64(v), nil
+		case int:
+			return float64(v), nil
+		case string:
+			return strconv.ParseFloat(v, 64)
+		}
+	}
+	return val, nil
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
