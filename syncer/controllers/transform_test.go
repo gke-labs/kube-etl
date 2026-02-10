@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -292,4 +293,57 @@ func TestSyncerTransformRegex(t *testing.T) {
 		return true, nil
 	})
 	assert.NoError(t, err, "ConfigMap should be synced to dest with resourceID extracted from externalRef")
+}
+
+func TestApplyTransformsCoercion(t *testing.T) {
+	obj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"spec": map[string]interface{}{
+				"port":    int64(80),
+				"enabled": true,
+				"ratio":   0.5,
+			},
+			"metadata": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"targetPort": "8080",
+					"setEnabled": "false",
+					"setRatio":   "0.8",
+				},
+			},
+		},
+	}
+
+	transforms := []krmv1alpha1.Transformation{
+		{
+			FieldTransform: &krmv1alpha1.FieldTransform{
+				Source:      "metadata.annotations.targetPort",
+				Destination: "spec.port",
+			},
+		},
+		{
+			FieldTransform: &krmv1alpha1.FieldTransform{
+				Source:      "metadata.annotations.setEnabled",
+				Destination: "spec.enabled",
+			},
+		},
+		{
+			FieldTransform: &krmv1alpha1.FieldTransform{
+				Source:      "metadata.annotations.setRatio",
+				Destination: "spec.ratio",
+			},
+		},
+	}
+
+	r := &DynamicResourceReconciler{}
+	err := r.applyTransforms(obj, transforms)
+	assert.NoError(t, err)
+
+	val, _, _ := unstructured.NestedFieldCopy(obj.Object, "spec", "port")
+	assert.Equal(t, int64(8080), val)
+
+	val, _, _ = unstructured.NestedFieldCopy(obj.Object, "spec", "enabled")
+	assert.Equal(t, false, val)
+
+	val, _, _ = unstructured.NestedFieldCopy(obj.Object, "spec", "ratio")
+	assert.Equal(t, 0.8, val)
 }

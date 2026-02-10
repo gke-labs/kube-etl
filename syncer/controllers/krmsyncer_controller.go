@@ -28,11 +28,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/clientcmd"
+	"regexp"
+	"strconv"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"strings"
-	"regexp"
 )
 
 // KRMSyncerReconciler reconciles a KRMSyncer object
@@ -294,12 +295,60 @@ func (r *DynamicResourceReconciler) applyTransforms(obj *unstructured.Unstructur
 			}
 
 			dstPath := strings.Split(dst, ".")
+
+			// Try to get existing destination value to determine target type
+			existingVal, found, err := unstructured.NestedFieldCopy(obj.Object, dstPath...)
+			if err == nil && found && existingVal != nil {
+				coercedVal, err := coerceType(finalVal, existingVal)
+				if err != nil {
+					return fmt.Errorf("failed to convert source value to match destination field %s type: %w", dst, err)
+				}
+				finalVal = coercedVal
+			}
+
 			if err := unstructured.SetNestedField(obj.Object, finalVal, dstPath...); err != nil {
 				return fmt.Errorf("failed to set destination field %s: %w", dst, err)
 			}
 		}
 	}
 	return nil
+}
+
+func coerceType(val interface{}, target interface{}) (interface{}, error) {
+	switch target.(type) {
+	case string:
+		return fmt.Sprintf("%v", val), nil
+	case int64:
+		switch v := val.(type) {
+		case int64:
+			return v, nil
+		case int:
+			return int64(v), nil
+		case float64:
+			return int64(v), nil
+		case string:
+			return strconv.ParseInt(v, 10, 64)
+		}
+	case bool:
+		switch v := val.(type) {
+		case bool:
+			return v, nil
+		case string:
+			return strconv.ParseBool(v)
+		}
+	case float64:
+		switch v := val.(type) {
+		case float64:
+			return v, nil
+		case int64:
+			return float64(v), nil
+		case int:
+			return float64(v), nil
+		case string:
+			return strconv.ParseFloat(v, 64)
+		}
+	}
+	return val, nil
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
