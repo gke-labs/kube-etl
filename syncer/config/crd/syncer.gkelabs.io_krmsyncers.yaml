@@ -99,6 +99,12 @@ spec:
                                 description: Destination is the JSON path to the field
                                   to set the value to (e.g., "spec.resourceID").
                                 type: string
+                              extractRegex:
+                                description: |-
+                                  ExtractRegex is an optional regular expression to extract a sub-string from the source field.
+                                  If provided, the first capture group will be used as the value to set in the destination.
+                                  Only applicable if the source field is a string.
+                                type: string
                               source:
                                 description: Source is the JSON path to the field
                                   to copy the value from (e.g., "status.externalRef").
