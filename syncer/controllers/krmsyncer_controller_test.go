@@ -92,6 +92,7 @@ func TestSyncerSync(t *testing.T) {
 		Client:  mgr.GetClient(),
 		Scheme:  mgr.GetScheme(),
 		Manager: mgr,
+		Name:    "krmsyncer-sync",
 	}).SetupWithManager(mgr)
 	require.NoError(t, err, "failed to setup controller")
 
@@ -132,6 +133,7 @@ func TestSyncerSync(t *testing.T) {
 				{
 					Group: "", Version: "v1", Kind: "ConfigMap",
 					Namespaces: []string{ns},
+					SyncFields: []string{"data"},
 				},
 			},
 		},
@@ -182,6 +184,266 @@ func TestSyncerSync(t *testing.T) {
 		return client.IgnoreNotFound(err) == nil && err != nil, nil
 	})
 	assert.NoError(t, err, "ConfigMap should be deleted from dest")
+}
+
+func TestSyncerSyncFields(t *testing.T) {
+	// Setup Logic
+	ctrl.SetLogger(klog.NewKlogr())
+	ctx, cancel := context.WithCancel(context.Background())
+	// Start Source Cluster
+	testEnvSource := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
+		ErrorIfCRDPathMissing: true,
+		DownloadBinaryAssets:  true,
+	}
+	cfgSource, err := testEnvSource.Start()
+	require.NoError(t, err)
+
+	// Start Destination Cluster
+	testEnvDest := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
+		ErrorIfCRDPathMissing: true,
+		DownloadBinaryAssets:  true,
+	}
+	cfgDest, err := testEnvDest.Start()
+	require.NoError(t, err)
+
+	defer func() {
+		cancel()
+		// give the manager a moment to stop
+		time.Sleep(100 * time.Millisecond)
+		require.NoError(t, testEnvSource.Stop())
+		require.NoError(t, testEnvDest.Stop())
+	}()
+
+	// Register Scheme
+	require.NoError(t, krmv1alpha1.AddToScheme(scheme.Scheme))
+
+	// Create Clients
+	k8sClientSource, err := client.New(cfgSource, client.Options{Scheme: scheme.Scheme})
+	require.NoError(t, err)
+	k8sClientDest, err := client.New(cfgDest, client.Options{Scheme: scheme.Scheme})
+	require.NoError(t, err)
+
+	// Start Manager in Source Cluster
+	mgr, err := ctrl.NewManager(cfgSource, ctrl.Options{
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
+		},
+	})
+	require.NoError(t, err, "failed to create manager")
+
+	err = (&KRMSyncerReconciler{
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Manager: mgr,
+		Name:    "krmsyncer-fields",
+	}).SetupWithManager(mgr)
+	require.NoError(t, err, "failed to setup controller")
+
+	go func() {
+		if err := mgr.Start(ctx); err != nil {
+			fmt.Printf("manager failed: %v\n", err)
+		}
+	}()
+
+	// Test Logic
+	ns := "default"
+	secretName := "dest-kubeconfig-fields"
+	syncerName := "test-syncer-fields"
+	configMapName := "test-cm-fields"
+
+	destKubeconfigContent, err := createKubeconfig(cfgDest)
+	require.NoError(t, err)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
+		Data:       map[string][]byte{"kubeconfig": destKubeconfigContent},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, secret))
+
+	// Create Syncer with SyncFields
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Destination: &krmv1alpha1.DestinationConfig{
+				ClusterConfig: &krmv1alpha1.ClusterConfig{
+					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
+				},
+			},
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "ConfigMap",
+					Namespaces: []string{ns},
+					SyncFields: []string{"data.key1"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+
+	// Create ConfigMap in Source with multiple keys
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: configMapName, Namespace: ns},
+		Data:       map[string]string{"key1": "val1", "key2": "val2"},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, cm))
+
+	// Verify ConfigMap Sync to Dest: only key1 should be present
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		destCm := &corev1.ConfigMap{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: configMapName, Namespace: ns}, destCm)
+		if err != nil {
+			return false, nil
+		}
+		_, key1Exists := destCm.Data["key1"]
+		_, key2Exists := destCm.Data["key2"]
+		return key1Exists && destCm.Data["key1"] == "val1" && !key2Exists, nil
+	})
+	assert.NoError(t, err, "ConfigMap should be synced to dest with only specified fields")
+}
+
+func TestSyncerSyncStatusSubresource(t *testing.T) {
+	// Setup Logic
+	ctrl.SetLogger(klog.NewKlogr())
+	ctx, cancel := context.WithCancel(context.Background())
+	testEnvSource := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
+		ErrorIfCRDPathMissing: true,
+		DownloadBinaryAssets:  true,
+	}
+	cfgSource, err := testEnvSource.Start()
+	require.NoError(t, err)
+
+	testEnvDest := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
+		ErrorIfCRDPathMissing: true,
+		DownloadBinaryAssets:  true,
+	}
+	cfgDest, err := testEnvDest.Start()
+	require.NoError(t, err)
+
+	defer func() {
+		cancel()
+		time.Sleep(100 * time.Millisecond)
+		require.NoError(t, testEnvSource.Stop())
+		require.NoError(t, testEnvDest.Stop())
+	}()
+
+	// Register Scheme
+	require.NoError(t, krmv1alpha1.AddToScheme(scheme.Scheme))
+
+	k8sClientSource, err := client.New(cfgSource, client.Options{Scheme: scheme.Scheme})
+	require.NoError(t, err)
+	k8sClientDest, err := client.New(cfgDest, client.Options{Scheme: scheme.Scheme})
+	require.NoError(t, err)
+
+	mgr, err := ctrl.NewManager(cfgSource, ctrl.Options{
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
+		},
+	})
+	require.NoError(t, err, "failed to create manager")
+
+	err = (&KRMSyncerReconciler{
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Manager: mgr,
+		Name:    "krmsyncer-status",
+	}).SetupWithManager(mgr)
+	require.NoError(t, err, "failed to setup controller")
+
+	go func() {
+		if err := mgr.Start(ctx); err != nil {
+			fmt.Printf("manager failed: %v\n", err)
+		}
+	}()
+
+	// Test Logic: Sync KRMSyncer itself (it has status subresource)
+	ns := "default"
+	secretName := "dest-kubeconfig-status"
+	syncerName := "test-syncer-status"
+	observedSyncerName := "observed-syncer"
+
+	destKubeconfigContent, err := createKubeconfig(cfgDest)
+	require.NoError(t, err)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
+		Data:       map[string][]byte{"kubeconfig": destKubeconfigContent},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, secret))
+
+	// Create observed syncer FIRST
+	observed := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: observedSyncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Destination: &krmv1alpha1.DestinationConfig{
+				ClusterConfig: &krmv1alpha1.ClusterConfig{
+					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
+				},
+			},
+			Rules: []krmv1alpha1.ResourceRule{}, // dummy
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, observed))
+
+	// Create syncer rule SECOND
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Destination: &krmv1alpha1.DestinationConfig{
+				ClusterConfig: &krmv1alpha1.ClusterConfig{
+					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
+				},
+			},
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "syncer.gkelabs.io", Version: "v1alpha1", Kind: "KRMSyncer",
+					Namespaces: []string{ns},
+					SyncFields: []string{"spec", "status"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+
+	// Wait for initial sync of observed syncer (spec only)
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		destSyncer := &krmv1alpha1.KRMSyncer{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: observedSyncerName, Namespace: ns}, destSyncer)
+		return err == nil, nil
+	})
+	require.NoError(t, err, "observed syncer should be synced initially")
+
+	// Update status of the observed syncer THIRD (to trigger event)
+	require.NoError(t, k8sClientSource.Get(ctx, types.NamespacedName{Name: observedSyncerName, Namespace: ns}, observed))
+	observed.Status.Conditions = []metav1.Condition{
+		{
+			Type:               "TestCondition",
+			Status:             metav1.ConditionTrue,
+			Reason:             "TestReason",
+			Message:            "TestMessage",
+			LastTransitionTime: metav1.Now(),
+		},
+	}
+	require.NoError(t, k8sClientSource.Status().Update(ctx, observed))
+
+	// Verify status sync to Dest
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		destSyncer := &krmv1alpha1.KRMSyncer{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: observedSyncerName, Namespace: ns}, destSyncer)
+		if err != nil {
+			return false, nil
+		}
+		for _, condition := range destSyncer.Status.Conditions {
+			if condition.Type == "TestCondition" {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	assert.NoError(t, err, "KRMSyncer status should be synced to dest")
 }
 
 func createKubeconfig(cfg *rest.Config) ([]byte, error) {

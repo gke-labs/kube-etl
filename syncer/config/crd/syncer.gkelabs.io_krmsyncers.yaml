@@ -83,6 +83,15 @@ spec:
                       items:
                         type: string
                       type: array
+                    syncFields:
+                      default:
+                      - status
+                      description: |-
+                        SyncFields is an optional list of fields to synchronize. If not provided, only the "status" field is synchronized.
+                        Examples: "spec", "status", "spec.resourceID".
+                      items:
+                        type: string
+                      type: array
                     version:
                       description: Version is the API version of the resource to be
                         synchronized.
