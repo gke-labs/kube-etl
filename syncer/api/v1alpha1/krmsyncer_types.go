@@ -54,6 +54,12 @@ type FieldTransform struct {
 
 	// Destination is the JSON path to the field to set the value to (e.g., "spec.resourceID").
 	Destination string `json:"destination"`
+
+	// ExtractRegex is an optional regular expression to extract a sub-string from the source field.
+	// If provided, the first capture group will be used as the value to set in the destination.
+	// Only applicable if the source field is a string.
+	// +optional
+	ExtractRegex string `json:"extractRegex,omitempty"`
 }
 
 // DestinationConfig defines where to push resources.

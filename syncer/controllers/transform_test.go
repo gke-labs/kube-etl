@@ -166,3 +166,130 @@ func TestSyncerTransform(t *testing.T) {
 	})
 	assert.NoError(t, err, "ConfigMap should be synced to dest with destKey set from sourceKey")
 }
+
+func TestSyncerTransformRegex(t *testing.T) {
+	// Setup Logic
+	ctrl.SetLogger(klog.NewKlogr())
+	ctx, cancel := context.WithCancel(t.Context())
+
+	// Start Source Cluster
+	testEnvSource := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
+		ErrorIfCRDPathMissing: true,
+		DownloadBinaryAssets:  true,
+	}
+	cfgSource, err := testEnvSource.Start()
+	require.NoError(t, err)
+
+	// Start Destination Cluster
+	testEnvDest := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
+		ErrorIfCRDPathMissing: true,
+		DownloadBinaryAssets:  true,
+	}
+	cfgDest, err := testEnvDest.Start()
+	require.NoError(t, err)
+
+	defer func() {
+		cancel()
+		time.Sleep(100 * time.Millisecond)
+		require.NoError(t, testEnvSource.Stop())
+		require.NoError(t, testEnvDest.Stop())
+	}()
+
+	require.NoError(t, krmv1alpha1.AddToScheme(scheme.Scheme))
+	k8sClientSource, err := client.New(cfgSource, client.Options{Scheme: scheme.Scheme})
+	require.NoError(t, err)
+	k8sClientDest, err := client.New(cfgDest, client.Options{Scheme: scheme.Scheme})
+	require.NoError(t, err)
+
+	mgr, err := ctrl.NewManager(cfgSource, ctrl.Options{
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	})
+	require.NoError(t, err)
+
+	r := &KRMSyncerReconciler{
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		Manager:              mgr,
+		WatchedGVKs:          make(map[schema.GroupVersionKind]bool),
+		ControllerNameSuffix: "regex-test",
+	}
+	err = ctrl.NewControllerManagedBy(mgr).
+		For(&krmv1alpha1.KRMSyncer{}).
+		Named("krmsyncer-regex-test").
+		Complete(r)
+	require.NoError(t, err)
+
+	go func() {
+		if err := mgr.Start(ctx); err != nil {
+			fmt.Printf("manager failed: %v\n", err)
+		}
+	}()
+
+	ns := "default"
+	secretName := "dest-kubeconfig-regex"
+	syncerName := "test-syncer-regex"
+	configMapName := "test-cm-regex"
+
+	destKubeconfigContent, err := createKubeconfig(cfgDest)
+	require.NoError(t, err)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
+		Data:       map[string][]byte{"kubeconfig": destKubeconfigContent},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, secret))
+
+	// Create Syncer with Transform using Regex
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Destination: &krmv1alpha1.DestinationConfig{
+				ClusterConfig: &krmv1alpha1.ClusterConfig{
+					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
+				},
+			},
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "ConfigMap",
+					Namespaces: []string{ns},
+					Transform: []krmv1alpha1.Transformation{
+						{
+							FieldTransform: &krmv1alpha1.FieldTransform{
+								Source:       "data.externalRef",
+								Destination:  "data.resourceID",
+								ExtractRegex: `projects/.+/keys/(.+)`,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+
+	// Create ConfigMap in Source with the source field
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: configMapName, Namespace: ns},
+		Data:       map[string]string{"externalRef": "projects/my-project/keys/my-key-id"},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, cm))
+
+	// Verify ConfigMap Sync to Dest and Transform
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		destCm := &corev1.ConfigMap{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: configMapName, Namespace: ns}, destCm)
+		if err != nil {
+			return false, nil
+		}
+
+		// Check if "resourceID" is extracted from "externalRef"
+		if destCm.Data["resourceID"] != "my-key-id" {
+			return false, nil
+		}
+
+		return true, nil
+	})
+	assert.NoError(t, err, "ConfigMap should be synced to dest with resourceID extracted from externalRef")
+}

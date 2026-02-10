@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"strings"
+	"regexp"
 )
 
 // KRMSyncerReconciler reconciles a KRMSyncer object
@@ -257,13 +258,14 @@ func (r *DynamicResourceReconciler) applyTransforms(obj *unstructured.Unstructur
 		if t.FieldTransform != nil {
 			src := t.FieldTransform.Source
 			dst := t.FieldTransform.Destination
+			regex := t.FieldTransform.ExtractRegex
 
 			if src == "" || dst == "" {
 				continue
 			}
 
 			srcPath := strings.Split(src, ".")
-			val, found, err := unstructured.NestedString(obj.Object, srcPath...)
+			val, found, err := unstructured.NestedFieldCopy(obj.Object, srcPath...)
 			if err != nil {
 				return fmt.Errorf("failed to get source field %s: %w", src, err)
 			}
@@ -272,8 +274,27 @@ func (r *DynamicResourceReconciler) applyTransforms(obj *unstructured.Unstructur
 				continue
 			}
 
+			var finalVal interface{} = val
+			if regex != "" {
+				strVal, ok := val.(string)
+				if !ok {
+					return fmt.Errorf("source field %s is not a string, but ExtractRegex is provided", src)
+				}
+
+				re, err := regexp.Compile(regex)
+				if err != nil {
+					return fmt.Errorf("invalid regex %s: %w", regex, err)
+				}
+
+				matches := re.FindStringSubmatch(strVal)
+				if len(matches) < 2 {
+					return fmt.Errorf("regex %s did not match source field %s (value: %s) or no capture group found", regex, src, strVal)
+				}
+				finalVal = matches[1]
+			}
+
 			dstPath := strings.Split(dst, ".")
-			if err := unstructured.SetNestedField(obj.Object, val, dstPath...); err != nil {
+			if err := unstructured.SetNestedField(obj.Object, finalVal, dstPath...); err != nil {
 				return fmt.Errorf("failed to set destination field %s: %w", dst, err)
 			}
 		}
