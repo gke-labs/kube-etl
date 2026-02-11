@@ -292,6 +292,22 @@ func (r *DynamicResourceReconciler) filterFields(src *unstructured.Unstructured,
 			if err := unstructured.SetNestedField(dest.Object, val, parts...); err != nil {
 				return nil, fmt.Errorf("failed to set field %s: %v", field, err)
 			}
+		} else if field == "spec.resourceID" {
+			// If the sync field is `spec.resourceID`, but it's not present in src object,
+			// extract the value from status.externalRef
+			externalRef, _, err := unstructured.NestedString(src.Object, "status", "externalRef")
+			if err != nil {
+				return nil, fmt.Errorf("reading status.externalRef: %w", err)
+			}
+			if externalRef == "" {
+				return nil, fmt.Errorf("status.externalRef is empty")
+			}
+			tokens := strings.Split(externalRef, "/")
+			resourceID := tokens[len(tokens)-1]
+			err = unstructured.SetNestedField(dest.Object, resourceID, "spec", "resourceID")
+			if err != nil {
+				return nil, fmt.Errorf("setting spec.resourceID: %w", err)
+			}
 		}
 	}
 	return dest, nil
