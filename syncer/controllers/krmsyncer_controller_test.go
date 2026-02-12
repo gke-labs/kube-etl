@@ -44,7 +44,7 @@ import (
 func TestSyncerSync(t *testing.T) {
 	// Setup Logic
 	ctrl.SetLogger(klog.NewKlogr())
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	// Start Source Cluster
 	testEnvSource := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
@@ -107,7 +107,7 @@ func TestSyncerSync(t *testing.T) {
 	ns := "default"
 	secretName := "dest-kubeconfig"
 	syncerName := "test-syncer"
-	targetSyncerName := "target-syncer"
+	targetServiceName := "target-service"
 
 	// Generate kubeconfig from envtest Dest config
 	destKubeconfigContent, err := createKubeconfig(cfgDest)
@@ -132,7 +132,7 @@ func TestSyncerSync(t *testing.T) {
 			},
 			Rules: []krmv1alpha1.ResourceRule{
 				{
-					Group: "syncer.gkelabs.io", Version: "v1alpha1", Kind: "KRMSyncer",
+					Group: "", Version: "v1", Kind: "Service",
 					Namespaces: []string{ns},
 					SyncFields: []string{"spec"},
 				},
@@ -141,64 +141,58 @@ func TestSyncerSync(t *testing.T) {
 	}
 	require.NoError(t, k8sClientSource.Create(ctx, syncer))
 
-	// Create target KRMSyncer in Source
-	target := &krmv1alpha1.KRMSyncer{
-		ObjectMeta: metav1.ObjectMeta{Name: targetSyncerName, Namespace: ns},
-		Spec: krmv1alpha1.KRMSyncerSpec{
-			Suspend: true,
-			Destination: &krmv1alpha1.DestinationConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: "dummy", Namespace: ns},
-				},
-			},
-			Rules: []krmv1alpha1.ResourceRule{},
+	// Create target Service in Source
+	target := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
 		},
 	}
 	require.NoError(t, k8sClientSource.Create(ctx, target))
 
-	// Verify KRMSyncer Sync to Dest
+	// Verify Service Sync to Dest
 	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		destSyncer := &krmv1alpha1.KRMSyncer{}
-		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetSyncerName, Namespace: ns}, destSyncer)
+		destSvc := &corev1.Service{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
 		if err != nil {
 			return false, nil
 		}
-		return destSyncer.Spec.Suspend == true, nil
+		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 80, nil
 	})
-	assert.NoError(t, err, "KRMSyncer should be synced to dest")
+	assert.NoError(t, err, "Service should be synced to dest")
 
-	// Update target KRMSyncer in Source
-	require.NoError(t, k8sClientSource.Get(ctx, types.NamespacedName{Name: targetSyncerName, Namespace: ns}, target))
-	target.Spec.Suspend = false
+	// Update target Service in Source
+	require.NoError(t, k8sClientSource.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, target))
+	target.Spec.Ports[0].Port = 8080
 	require.NoError(t, k8sClientSource.Update(ctx, target))
 
-	// Verify KRMSyncer Update in Dest
+	// Verify Service Update in Dest
 	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		destSyncer := &krmv1alpha1.KRMSyncer{}
-		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetSyncerName, Namespace: ns}, destSyncer)
+		destSvc := &corev1.Service{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
 		if err != nil {
 			return false, nil
 		}
-		return destSyncer.Spec.Suspend == false, nil
+		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 8080, nil
 	})
-	assert.NoError(t, err, "KRMSyncer update should be synced to dest")
+	assert.NoError(t, err, "Service update should be synced to dest")
 
-	// Delete target KRMSyncer in Source
+	// Delete target Service in Source
 	require.NoError(t, k8sClientSource.Delete(ctx, target))
 
 	// Verify Deletion in Dest
 	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		destSyncer := &krmv1alpha1.KRMSyncer{}
-		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetSyncerName, Namespace: ns}, destSyncer)
+		destSvc := &corev1.Service{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
 		return client.IgnoreNotFound(err) == nil && err != nil, nil
 	})
-	assert.NoError(t, err, "KRMSyncer should be deleted from dest")
+	assert.NoError(t, err, "Service should be deleted from dest")
 }
 
 func TestSyncerSyncFields(t *testing.T) {
 	// Setup Logic
 	ctrl.SetLogger(klog.NewKlogr())
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	// Start Source Cluster
 	testEnvSource := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
@@ -260,7 +254,7 @@ func TestSyncerSyncFields(t *testing.T) {
 	ns := "default"
 	secretName := "dest-kubeconfig-fields"
 	syncerName := "test-syncer-fields"
-	targetName := "test-resource-fields"
+	targetName := "test-service-fields"
 
 	destKubeconfigContent, err := createKubeconfig(cfgDest)
 	require.NoError(t, err)
@@ -282,7 +276,7 @@ func TestSyncerSyncFields(t *testing.T) {
 			},
 			Rules: []krmv1alpha1.ResourceRule{
 				{
-					Group: "syncer.gkelabs.io", Version: "v1alpha1", Kind: "KRMSyncer",
+					Group: "", Version: "v1", Kind: "Service",
 					Namespaces: []string{ns},
 					SyncFields: []string{"spec"},
 				},
@@ -291,37 +285,42 @@ func TestSyncerSyncFields(t *testing.T) {
 	}
 	require.NoError(t, k8sClientSource.Create(ctx, syncer))
 
-	// Create KRMSyncer resource in Source
-	target := &krmv1alpha1.KRMSyncer{
+	// Create Service resource in Source
+	target := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: targetName, Namespace: ns},
-		Spec: krmv1alpha1.KRMSyncerSpec{
-			Suspend: true,
-			Destination: &krmv1alpha1.DestinationConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: "dummy", Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": "test-fields"},
+			Ports: []corev1.ServicePort{
+				{
+					Name: "http",
+					Port: 80,
 				},
 			},
-			Rules: []krmv1alpha1.ResourceRule{},
+			Type: corev1.ServiceTypeClusterIP,
 		},
 	}
 	require.NoError(t, k8sClientSource.Create(ctx, target))
 
-	// Verify Sync to Dest: spec should be present
+	// Verify Sync to Dest: spec should be present with nested fields
 	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		destU := &krmv1alpha1.KRMSyncer{}
-		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetName, Namespace: ns}, destU)
+		destSvc := &corev1.Service{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetName, Namespace: ns}, destSvc)
 		if err != nil {
 			return false, nil
 		}
-		return destU.Spec.Suspend == true && destU.Spec.Destination != nil, nil
+		// ServiceSpec has primitive (Type), complex (Selector), and nested types (Ports)
+		return destSvc.Spec.Type == corev1.ServiceTypeClusterIP &&
+			destSvc.Spec.Selector["app"] == "test-fields" &&
+			len(destSvc.Spec.Ports) == 1 &&
+			destSvc.Spec.Ports[0].Port == 80, nil
 	})
-	assert.NoError(t, err, "Resource should be synced to dest with only specified fields")
+	assert.NoError(t, err, "Service should be synced to dest with all spec fields")
 }
 
 func TestSyncerSyncStatusSubresource(t *testing.T) {
 	// Setup Logic
 	ctrl.SetLogger(klog.NewKlogr())
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	testEnvSource := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
@@ -374,11 +373,11 @@ func TestSyncerSyncStatusSubresource(t *testing.T) {
 		}
 	}()
 
-	// Test Logic: Sync KRMSyncer itself (it has status subresource)
+	// Test Logic: Sync Service itself (it has status subresource)
 	ns := "default"
 	secretName := "dest-kubeconfig-status"
 	syncerName := "test-syncer-status"
-	observedSyncerName := "observed-syncer"
+	observedServiceName := "observed-service"
 
 	destKubeconfigContent, err := createKubeconfig(cfgDest)
 	require.NoError(t, err)
@@ -389,16 +388,12 @@ func TestSyncerSyncStatusSubresource(t *testing.T) {
 	}
 	require.NoError(t, k8sClientSource.Create(ctx, secret))
 
-	// Create observed syncer FIRST
-	observed := &krmv1alpha1.KRMSyncer{
-		ObjectMeta: metav1.ObjectMeta{Name: observedSyncerName, Namespace: ns},
-		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
-				},
-			},
-			Rules: []krmv1alpha1.ResourceRule{}, // dummy
+	// Create observed service FIRST
+	observed := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: observedServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
+			Type:  corev1.ServiceTypeLoadBalancer,
 		},
 	}
 	require.NoError(t, k8sClientSource.Create(ctx, observed))
@@ -414,7 +409,7 @@ func TestSyncerSyncStatusSubresource(t *testing.T) {
 			},
 			Rules: []krmv1alpha1.ResourceRule{
 				{
-					Group: "syncer.gkelabs.io", Version: "v1alpha1", Kind: "KRMSyncer",
+					Group: "", Version: "v1", Kind: "Service",
 					Namespaces: []string{ns},
 					SyncFields: []string{"spec", "status"},
 				},
@@ -423,48 +418,37 @@ func TestSyncerSyncStatusSubresource(t *testing.T) {
 	}
 	require.NoError(t, k8sClientSource.Create(ctx, syncer))
 
-	// Wait for initial sync of observed syncer (spec only)
+	// Wait for initial sync of observed service (spec only)
 	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		destSyncer := &krmv1alpha1.KRMSyncer{}
-		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: observedSyncerName, Namespace: ns}, destSyncer)
+		destSvc := &corev1.Service{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: observedServiceName, Namespace: ns}, destSvc)
 		return err == nil, nil
 	})
-	require.NoError(t, err, "observed syncer should be synced initially")
+	require.NoError(t, err, "observed service should be synced initially")
 
-	// Update status of the observed syncer THIRD (to trigger event)
-	require.NoError(t, k8sClientSource.Get(ctx, types.NamespacedName{Name: observedSyncerName, Namespace: ns}, observed))
-	observed.Status.Conditions = []metav1.Condition{
-		{
-			Type:               "TestCondition",
-			Status:             metav1.ConditionTrue,
-			Reason:             "TestReason",
-			Message:            "TestMessage",
-			LastTransitionTime: metav1.Now(),
-		},
+	// Update status of the observed service THIRD (to trigger event)
+	require.NoError(t, k8sClientSource.Get(ctx, types.NamespacedName{Name: observedServiceName, Namespace: ns}, observed))
+	observed.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
+		{IP: "1.2.3.4"},
 	}
 	require.NoError(t, k8sClientSource.Status().Update(ctx, observed))
 
 	// Verify status sync to Dest
 	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		destSyncer := &krmv1alpha1.KRMSyncer{}
-		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: observedSyncerName, Namespace: ns}, destSyncer)
+		destSvc := &corev1.Service{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: observedServiceName, Namespace: ns}, destSvc)
 		if err != nil {
 			return false, nil
 		}
-		for _, condition := range destSyncer.Status.Conditions {
-			if condition.Type == "TestCondition" {
-				return true, nil
-			}
-		}
-		return false, nil
+		return len(destSvc.Status.LoadBalancer.Ingress) > 0 && destSvc.Status.LoadBalancer.Ingress[0].IP == "1.2.3.4", nil
 	})
-	assert.NoError(t, err, "KRMSyncer status should be synced to dest")
+	assert.NoError(t, err, "Service status should be synced to dest")
 }
 
 func TestSyncerValidation(t *testing.T) {
 	// Setup Logic
 	ctrl.SetLogger(klog.NewKlogr())
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	testEnvSource := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
@@ -497,7 +481,7 @@ func TestSyncerValidation(t *testing.T) {
 			Rules: []krmv1alpha1.ResourceRule{
 				{
 					Group: "syncer.gkelabs.io", Version: "v1alpha1", Kind: "KRMSyncer",
-					SyncFields: []string{"spec", "status", "spec.resourceID", "spec.resource.ID"},
+					SyncFields: []string{"spec", "status", "spec.resourceID"},
 				},
 			},
 		},
@@ -523,7 +507,7 @@ func TestSyncerValidation(t *testing.T) {
 	}
 	err = k8sClientSource.Create(ctx, invalidSyncer)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "supported values: \"spec\", \"status\", \"spec.resourceID\", \"spec.resource.ID\"")
+	assert.Contains(t, err.Error(), "supported values: \"spec\", \"status\", \"spec.resourceID\"")
 
 	// Test case 3: Default value
 	defaultSyncer := &krmv1alpha1.KRMSyncer{
@@ -575,8 +559,8 @@ func TestFilterFields(t *testing.T) {
 		},
 	}
 
-	// Test case 1: Sync spec.resourceID, spec.resource.ID and status
-	fields := []string{"spec.resourceID", "spec.resource.ID", "status"}
+	// Test case 1: Sync spec.resourceID and status
+	fields := []string{"spec.resourceID", "status"}
 	dest, err := dr.filterFields(src, fields)
 	assert.NoError(t, err)
 
@@ -584,9 +568,8 @@ func TestFilterFields(t *testing.T) {
 	assert.True(t, found)
 	assert.Equal(t, "id1", val)
 
-	val2, found, _ := unstructured.NestedString(dest.Object, "spec", "resource", "ID")
-	assert.True(t, found)
-	assert.Equal(t, "id2", val2)
+	_, found, _ = unstructured.NestedMap(dest.Object, "spec", "resource")
+	assert.False(t, found)
 
 	_, found, _ = unstructured.NestedString(dest.Object, "spec", "other")
 	assert.False(t, found)
@@ -597,6 +580,54 @@ func TestFilterFields(t *testing.T) {
 
 	assert.Equal(t, "test", dest.GetName())
 	assert.Equal(t, "v1", dest.GetLabels()["l1"])
+
+	// Test case 2: Sync full "spec" with nested fields of various types
+	srcFull := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata": map[string]interface{}{
+				"name": "full-spec-test",
+			},
+			"spec": map[string]interface{}{
+				"primitive": "string-val",
+				"integer":   int64(42),
+				"boolean":   true,
+				"complex": map[string]interface{}{
+					"field1": "val1",
+					"field2": int64(2),
+					"nested": map[string]interface{}{
+						"deep": "deeper",
+					},
+				},
+				"list": []interface{}{
+					map[string]interface{}{"item": int64(1)},
+					"simple-item",
+				},
+			},
+		},
+	}
+	fieldsFull := []string{"spec"}
+	destFull, err := dr.filterFields(srcFull, fieldsFull)
+	assert.NoError(t, err)
+
+	spec, found, _ := unstructured.NestedMap(destFull.Object, "spec")
+	assert.True(t, found)
+	assert.Equal(t, "string-val", spec["primitive"])
+	assert.Equal(t, int64(42), spec["integer"])
+	assert.Equal(t, true, spec["boolean"])
+
+	complexVal, found, _ := unstructured.NestedMap(destFull.Object, "spec", "complex")
+	assert.True(t, found)
+	assert.Equal(t, "val1", complexVal["field1"])
+
+	deepVal, found, _ := unstructured.NestedString(destFull.Object, "spec", "complex", "nested", "deep")
+	assert.True(t, found)
+	assert.Equal(t, "deeper", deepVal)
+
+	listVal, found, _ := unstructured.NestedSlice(destFull.Object, "spec", "list")
+	assert.True(t, found)
+	assert.Len(t, listVal, 2)
 }
 
 func createKubeconfig(cfg *rest.Config) ([]byte, error) {
