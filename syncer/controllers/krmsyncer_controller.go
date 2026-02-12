@@ -20,6 +20,7 @@ import (
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -38,6 +39,7 @@ type KRMSyncerReconciler struct {
 	client.Client
 	Scheme  *runtime.Scheme
 	Manager ctrl.Manager
+	Name    string
 
 	// WatchedGVKs tracks which GVKs are already being watched
 	WatchedGVKs map[schema.GroupVersionKind]bool
@@ -126,14 +128,19 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 	// e.g. It doesn't exceed length limits for very long GVK names.
 	return ctrl.NewControllerManagedBy(r.Manager).
 		For(u).
-		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
+		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s-%s", r.Name, gvk.Group, gvk.Version, gvk.Kind)).
 		Complete(dr)
 }
 
 func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
+	name := "krmsyncer"
+	if r.Name != "" {
+		name = r.Name
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
+		Named(name).
 		Complete(r)
 }
 
@@ -217,7 +224,15 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 			// Sync to Remote Cluster
 			logger.Info("Syncing resource to remote cluster", "name", u.GetName(), "namespace", u.GetNamespace())
-			remoteObj := u.DeepCopy()
+
+			syncFields := rule.SyncFields
+			remoteObj, err := r.filterFields(u, syncFields)
+			if err != nil {
+				// TODO: report failure in syncer status
+				logger.Error(err, "Failed to filter fields")
+				continue
+			}
+
 			// Prepare object for remote: clear ResourceVersion, UID, etc.
 			// Example error: "resourceVersion should not be set on objects to be created".
 			remoteObj.SetResourceVersion("")
@@ -263,12 +278,69 @@ func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsync
 	return client.New(restConfig, client.Options{})
 }
 
+func (r *DynamicResourceReconciler) filterFields(src *unstructured.Unstructured, fields []string) (*unstructured.Unstructured, error) {
+	dest := &unstructured.Unstructured{
+		Object: make(map[string]interface{}),
+	}
+	dest.SetGroupVersionKind(src.GroupVersionKind())
+	dest.SetName(src.GetName())
+	dest.SetNamespace(src.GetNamespace())
+	dest.SetLabels(src.GetLabels())
+	dest.SetAnnotations(src.GetAnnotations())
+
+	for _, field := range fields {
+		parts := strings.Split(field, ".")
+		val, found, err := unstructured.NestedFieldCopy(src.Object, parts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get field %s: %v", field, err)
+		}
+		if found {
+			if err := unstructured.SetNestedField(dest.Object, val, parts...); err != nil {
+				return nil, fmt.Errorf("failed to set field %s: %v", field, err)
+			}
+		}
+	}
+	return dest, nil
+}
+
 func (r *DynamicResourceReconciler) applyToRemote(ctx context.Context, remoteClient client.Client, obj *unstructured.Unstructured) error {
-	// Use Server-Side Apply (SSA) to create or update the resource.
-	// This reduces round-trips (no need for Get) and handles conflicts gracefully.
 	patchOpts := []client.PatchOption{
 		client.ForceOwnership,
 		client.FieldOwner("krm-syncer"),
 	}
-	return remoteClient.Patch(ctx, obj, client.Apply, patchOpts...)
+
+	status, found, err := unstructured.NestedFieldCopy(obj.Object, "status")
+	if err != nil {
+		return fmt.Errorf("failed to copy status: %v", err)
+	}
+
+	// Use Server-Side Apply (SSA) to create or update the resource.
+	// This reduces round-trips (no need for Get) and handles conflicts gracefully.
+	if err := remoteClient.Patch(ctx, obj, client.Apply, patchOpts...); err != nil {
+		return fmt.Errorf("failed to apply object to remote: %v", err)
+	}
+
+	// If status is present, we also need to patch the status subresource.
+	// For many resources, status is a subresource and is ignored by the main patch.
+	if found {
+		statusObj := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": obj.GetAPIVersion(),
+				"kind":       obj.GetKind(),
+				"metadata": map[string]interface{}{
+					"name":      obj.GetName(),
+					"namespace": obj.GetNamespace(),
+				},
+				"status": status,
+			},
+		}
+		subResourcePatchOpts := []client.SubResourcePatchOption{
+			client.ForceOwnership,
+			client.FieldOwner("krm-syncer"),
+		}
+		if err := remoteClient.Status().Patch(ctx, statusObj, client.Apply, subResourcePatchOpts...); err != nil {
+			return fmt.Errorf("failed to apply status subresource to remote: %v", err)
+		}
+	}
+	return nil
 }

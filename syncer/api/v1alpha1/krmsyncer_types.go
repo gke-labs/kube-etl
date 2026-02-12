@@ -31,6 +31,11 @@ type ResourceRule struct {
 	// Namespaces is an optional list of namespaces to watch. If not provided, all namespaces are synchronized.
 	// +optional
 	Namespaces []string `json:"namespaces,omitempty"`
+	// SyncFields is an optional list of fields to synchronize. If not provided, only the "status" field is synchronized.
+	// Examples: "spec", "status", "spec.resourceID".
+	// +optional
+	// +kubebuilder:default={"status"}
+	SyncFields []string `json:"syncFields,omitempty"`
 }
 
 // DestinationConfig defines where to push resources.
