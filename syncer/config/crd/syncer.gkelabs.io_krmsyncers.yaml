@@ -94,7 +94,6 @@ spec:
                         - spec
                         - status
                         - spec.resourceID
-                        - spec.resource.ID
                         type: string
                       type: array
                     version:
