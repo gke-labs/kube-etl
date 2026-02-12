@@ -32,8 +32,9 @@ type ResourceRule struct {
 	// +optional
 	Namespaces []string `json:"namespaces,omitempty"`
 	// SyncFields is an optional list of fields to synchronize. If not provided, only the "status" field is synchronized.
-	// Examples: "spec", "status", "spec.resourceID".
+	// Examples: "spec", "status", "spec.resourceID", "spec.resource.ID".
 	// +optional
+	// +kubebuilder:validation:Items:Enum=spec;status;spec.resourceID;spec.resource.ID
 	// +kubebuilder:default={"status"}
 	SyncFields []string `json:"syncFields,omitempty"`
 }
