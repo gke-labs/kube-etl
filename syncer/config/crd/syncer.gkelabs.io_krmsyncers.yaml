@@ -90,6 +90,10 @@ spec:
                         SyncFields is an optional list of fields to synchronize. If not provided, only the "status" field is synchronized.
                         Examples: "spec", "status", "spec.resourceID".
                       items:
+                        enum:
+                        - spec
+                        - status
+                        - spec.resourceID
                         type: string
                       type: array
                     version:
