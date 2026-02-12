@@ -39,7 +39,6 @@ type KRMSyncerReconciler struct {
 	client.Client
 	Scheme  *runtime.Scheme
 	Manager ctrl.Manager
-	Name    string
 
 	// WatchedGVKs tracks which GVKs are already being watched
 	WatchedGVKs map[schema.GroupVersionKind]bool
@@ -128,19 +127,14 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 	// e.g. It doesn't exceed length limits for very long GVK names.
 	return ctrl.NewControllerManagedBy(r.Manager).
 		For(u).
-		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s-%s", r.Name, gvk.Group, gvk.Version, gvk.Kind)).
+		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
 		Complete(dr)
 }
 
 func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
-	name := "krmsyncer"
-	if r.Name != "" {
-		name = r.Name
-	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
-		Named(name).
 		Complete(r)
 }
 
