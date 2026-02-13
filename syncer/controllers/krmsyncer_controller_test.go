@@ -20,6 +20,7 @@ import (
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/client-go/rest"
+	"os"
 	"path/filepath"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"testing"
@@ -41,68 +42,107 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
-func TestSyncerSync(t *testing.T) {
-	// Setup Logic
+var (
+	cfgSource       *rest.Config
+	cfgDest         *rest.Config
+	k8sClientSource client.Client
+	k8sClientDest   client.Client
+	testEnvSource   *envtest.Environment
+	testEnvDest     *envtest.Environment
+	mgrCtx          context.Context
+	mgrCancel       context.CancelFunc
+)
+
+func TestMain(m *testing.M) {
 	ctrl.SetLogger(klog.NewKlogr())
-	ctx, cancel := context.WithCancel(t.Context())
+	mgrCtx, mgrCancel = context.WithCancel(ctrl.SetupSignalHandler())
+
 	// Start Source Cluster
-	testEnvSource := &envtest.Environment{
+	testEnvSource = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
 		DownloadBinaryAssets:  true,
 	}
-	cfgSource, err := testEnvSource.Start()
-	require.NoError(t, err)
+	var err error
+	cfgSource, err = testEnvSource.Start()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to start source test env: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Start Destination Cluster
-	testEnvDest := &envtest.Environment{
+	testEnvDest = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
 		DownloadBinaryAssets:  true,
 	}
-	cfgDest, err := testEnvDest.Start()
-	require.NoError(t, err)
-
-	defer func() {
-		cancel()
-		// give the manager a moment to stop
-		time.Sleep(100 * time.Millisecond)
-		require.NoError(t, testEnvSource.Stop())
-		require.NoError(t, testEnvDest.Stop())
-	}()
+	cfgDest, err = testEnvDest.Start()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to start dest test env: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Register Scheme
-	require.NoError(t, krmv1alpha1.AddToScheme(scheme.Scheme))
+	if err := krmv1alpha1.AddToScheme(scheme.Scheme); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to add to scheme: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Create Clients
-	k8sClientSource, err := client.New(cfgSource, client.Options{Scheme: scheme.Scheme})
-	require.NoError(t, err)
-	k8sClientDest, err := client.New(cfgDest, client.Options{Scheme: scheme.Scheme})
-	require.NoError(t, err)
+	k8sClientSource, err = client.New(cfgSource, client.Options{Scheme: scheme.Scheme})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create source client: %v\n", err)
+		os.Exit(1)
+	}
+	k8sClientDest, err = client.New(cfgDest, client.Options{Scheme: scheme.Scheme})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create dest client: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Start Manager in Source Cluster
 	mgr, err := ctrl.NewManager(cfgSource, ctrl.Options{
-		// Scheme: scheme.Scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: "0",
 		},
 	})
-	require.NoError(t, err, "failed to create manager")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create manager: %v\n", err)
+		os.Exit(1)
+	}
 
-	err = (&KRMSyncerReconciler{
+	if err := (&KRMSyncerReconciler{
 		Client:  mgr.GetClient(),
 		Scheme:  mgr.GetScheme(),
 		Manager: mgr,
-		Name:    "krmsyncer-sync",
-	}).SetupWithManager(mgr)
-	require.NoError(t, err, "failed to setup controller")
+	}).SetupWithManager(mgr); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to setup controller: %v\n", err)
+		os.Exit(1)
+	}
 
 	go func() {
-		if err := mgr.Start(ctx); err != nil {
-			fmt.Printf("manager failed: %v\n", err)
+		if err := mgr.Start(mgrCtx); err != nil {
+			klog.ErrorS(err, "manager failed")
 		}
 	}()
 
+	code := m.Run()
+
+	mgrCancel()
+	// give the manager a moment to stop
+	time.Sleep(100 * time.Millisecond)
+	if err := testEnvSource.Stop(); err != nil {
+		klog.ErrorS(err, "failed to stop source test env")
+	}
+	if err := testEnvDest.Stop(); err != nil {
+		klog.ErrorS(err, "failed to stop dest test env")
+	}
+
+	os.Exit(code)
+}
+
+func TestSyncerSync(t *testing.T) {
+	ctx := t.Context()
 	// Test Logic
 	ns := "default"
 	secretName := "dest-kubeconfig"
@@ -190,66 +230,7 @@ func TestSyncerSync(t *testing.T) {
 }
 
 func TestSyncerSyncFields(t *testing.T) {
-	// Setup Logic
-	ctrl.SetLogger(klog.NewKlogr())
-	ctx, cancel := context.WithCancel(t.Context())
-	// Start Source Cluster
-	testEnvSource := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
-		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
-	}
-	cfgSource, err := testEnvSource.Start()
-	require.NoError(t, err)
-
-	// Start Destination Cluster
-	testEnvDest := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
-		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
-	}
-	cfgDest, err := testEnvDest.Start()
-	require.NoError(t, err)
-
-	defer func() {
-		cancel()
-		// give the manager a moment to stop
-		time.Sleep(100 * time.Millisecond)
-		require.NoError(t, testEnvSource.Stop())
-		require.NoError(t, testEnvDest.Stop())
-	}()
-
-	// Register Scheme
-	require.NoError(t, krmv1alpha1.AddToScheme(scheme.Scheme))
-
-	// Create Clients
-	k8sClientSource, err := client.New(cfgSource, client.Options{Scheme: scheme.Scheme})
-	require.NoError(t, err)
-	k8sClientDest, err := client.New(cfgDest, client.Options{Scheme: scheme.Scheme})
-	require.NoError(t, err)
-
-	// Start Manager in Source Cluster
-	mgr, err := ctrl.NewManager(cfgSource, ctrl.Options{
-		Metrics: metricsserver.Options{
-			BindAddress: "0",
-		},
-	})
-	require.NoError(t, err, "failed to create manager")
-
-	err = (&KRMSyncerReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Manager: mgr,
-		Name:    "krmsyncer-fields",
-	}).SetupWithManager(mgr)
-	require.NoError(t, err, "failed to setup controller")
-
-	go func() {
-		if err := mgr.Start(ctx); err != nil {
-			fmt.Printf("manager failed: %v\n", err)
-		}
-	}()
-
+	ctx := t.Context()
 	// Test Logic
 	ns := "default"
 	secretName := "dest-kubeconfig-fields"
@@ -318,61 +299,7 @@ func TestSyncerSyncFields(t *testing.T) {
 }
 
 func TestSyncerSyncStatusSubresource(t *testing.T) {
-	// Setup Logic
-	ctrl.SetLogger(klog.NewKlogr())
-	ctx, cancel := context.WithCancel(t.Context())
-	testEnvSource := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
-		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
-	}
-	cfgSource, err := testEnvSource.Start()
-	require.NoError(t, err)
-
-	testEnvDest := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
-		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
-	}
-	cfgDest, err := testEnvDest.Start()
-	require.NoError(t, err)
-
-	defer func() {
-		cancel()
-		time.Sleep(100 * time.Millisecond)
-		require.NoError(t, testEnvSource.Stop())
-		require.NoError(t, testEnvDest.Stop())
-	}()
-
-	// Register Scheme
-	require.NoError(t, krmv1alpha1.AddToScheme(scheme.Scheme))
-
-	k8sClientSource, err := client.New(cfgSource, client.Options{Scheme: scheme.Scheme})
-	require.NoError(t, err)
-	k8sClientDest, err := client.New(cfgDest, client.Options{Scheme: scheme.Scheme})
-	require.NoError(t, err)
-
-	mgr, err := ctrl.NewManager(cfgSource, ctrl.Options{
-		Metrics: metricsserver.Options{
-			BindAddress: "0",
-		},
-	})
-	require.NoError(t, err, "failed to create manager")
-
-	err = (&KRMSyncerReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Manager: mgr,
-		Name:    "krmsyncer-status",
-	}).SetupWithManager(mgr)
-	require.NoError(t, err, "failed to setup controller")
-
-	go func() {
-		if err := mgr.Start(ctx); err != nil {
-			fmt.Printf("manager failed: %v\n", err)
-		}
-	}()
-
+	ctx := t.Context()
 	// Test Logic: Sync Service itself (it has status subresource)
 	ns := "default"
 	secretName := "dest-kubeconfig-status"
@@ -446,27 +373,7 @@ func TestSyncerSyncStatusSubresource(t *testing.T) {
 }
 
 func TestSyncerValidation(t *testing.T) {
-	// Setup Logic
-	ctrl.SetLogger(klog.NewKlogr())
-	ctx, cancel := context.WithCancel(t.Context())
-	testEnvSource := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
-		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
-	}
-	cfgSource, err := testEnvSource.Start()
-	require.NoError(t, err)
-
-	defer func() {
-		cancel()
-		time.Sleep(100 * time.Millisecond)
-		require.NoError(t, testEnvSource.Stop())
-	}()
-
-	require.NoError(t, krmv1alpha1.AddToScheme(scheme.Scheme))
-	k8sClientSource, err := client.New(cfgSource, client.Options{Scheme: scheme.Scheme})
-	require.NoError(t, err)
-
+	ctx := t.Context()
 	ns := "default"
 
 	// Test case 1: Valid syncFields
@@ -505,7 +412,7 @@ func TestSyncerValidation(t *testing.T) {
 			},
 		},
 	}
-	err = k8sClientSource.Create(ctx, invalidSyncer)
+	err := k8sClientSource.Create(ctx, invalidSyncer)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "supported values: \"spec\", \"status\", \"spec.resourceID\"")
 
