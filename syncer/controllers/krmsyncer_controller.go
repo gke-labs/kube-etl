@@ -213,6 +213,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						logger.Error(err, "Failed to delete resource on remote cluster")
 					}
 				}
+				logger.Info("Successfully deleted resource on remote cluster", "name", req.Name, "namespace", req.Namespace)
 				continue
 			}
 
