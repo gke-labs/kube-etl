@@ -535,6 +535,48 @@ func TestFilterFields(t *testing.T) {
 	listVal, found, _ := unstructured.NestedSlice(destFull.Object, "spec", "list")
 	assert.True(t, found)
 	assert.Len(t, listVal, 2)
+
+	// Test case 3: spec.resourceID not in spec, but in status.externalRef
+	srcSpecial := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "syncer.gkelabs.io/v1alpha1",
+			"kind":       "KRMSyncer",
+			"metadata": map[string]interface{}{
+				"name":      "special-test",
+				"namespace": "default",
+			},
+			"spec": map[string]interface{}{
+				"other": "val",
+			},
+			"status": map[string]interface{}{
+				"externalRef": "projects/p1/locations/l1/resources/r1",
+			},
+		},
+	}
+	fieldsSpecial := []string{"spec.resourceID"}
+	destSpecial, err := dr.filterFields(srcSpecial, fieldsSpecial)
+	assert.NoError(t, err)
+
+	valSpecial, found, _ := unstructured.NestedString(destSpecial.Object, "spec", "resourceID")
+	assert.True(t, found)
+	assert.Equal(t, "r1", valSpecial)
+
+	// Test case 4: spec.resourceID missing and status.externalRef is empty
+	srcEmpty := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "syncer.gkelabs.io/v1alpha1",
+			"kind":       "KRMSyncer",
+			"metadata": map[string]interface{}{
+				"name": "empty-test",
+			},
+			"status": map[string]interface{}{
+				"externalRef": "",
+			},
+		},
+	}
+	_, err = dr.filterFields(srcEmpty, []string{"spec.resourceID"})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "status.externalRef is empty")
 }
 
 func createKubeconfig(cfg *rest.Config) ([]byte, error) {
