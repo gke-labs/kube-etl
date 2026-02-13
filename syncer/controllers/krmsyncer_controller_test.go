@@ -131,8 +131,12 @@ func TestMain(m *testing.M) {
 	mgrCancel()
 	// give the manager a moment to stop
 	time.Sleep(100 * time.Millisecond)
-	_ = testEnvSource.Stop()
-	_ = testEnvDest.Stop()
+	if err := testEnvSource.Stop(); err != nil {
+		klog.ErrorS(err, "failed to stop source test env")
+	}
+	if err := testEnvDest.Stop(); err != nil {
+		klog.ErrorS(err, "failed to stop dest test env")
+	}
 
 	os.Exit(code)
 }
