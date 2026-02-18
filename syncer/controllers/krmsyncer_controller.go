@@ -158,6 +158,8 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		} else {
 			return ctrl.Result{}, err
 		}
+	} else if u.GetDeletionTimestamp() != nil {
+		isDeleted = true
 	}
 
 	// Fetch all Syncers to find matching rules (Active ones)
@@ -213,6 +215,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						logger.Error(err, "Failed to delete resource on remote cluster")
 					}
 				}
+				logger.Info("Successfully deleted resource on remote cluster", "name", req.Name, "namespace", req.Namespace)
 				continue
 			}
 
@@ -233,6 +236,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			remoteObj.SetUID("")
 			remoteObj.SetGeneration(0)
 			remoteObj.SetManagedFields(nil)
+			remoteObj.SetFinalizers(nil)
 
 			if err := r.applyToRemote(ctx, remoteClient, remoteObj); err != nil {
 				// TODO: report failure in syncer status
