@@ -142,6 +142,10 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 type DynamicResourceReconciler struct {
 	client.Client
 	GVK schema.GroupVersionKind
+
+	// GetRemoteClient is a function that returns a client for the remote cluster.
+	// It is a field so it can be overridden in tests.
+	GetRemoteClient func(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error)
 }
 
 func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -192,7 +196,11 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			// Get Remote Client
-			remoteClient, err := r.getRemoteClient(ctx, &krmsyncer)
+			getRemoteClient := r.GetRemoteClient
+			if getRemoteClient == nil {
+				getRemoteClient = r.getRemoteClient
+			}
+			remoteClient, err := getRemoteClient(ctx, &krmsyncer)
 			if err != nil {
 				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to get remote client")
