@@ -1,0 +1,15 @@
+apiVersion: syncer.gkelabs.io/v1alpha1
+kind: KRMSyncer
+metadata:
+  name: suspend-syncer
+  namespace: default
+spec:
+  suspend: true
+  destination:
+    clusterConfig:
+      kubeConfigSecretRef:
+        name: dest-kubeconfig
+  rules:
+  - group: e2e.gkelabs.io
+    version: v1alpha1
+    kind: TestCRD

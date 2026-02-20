@@ -1,0 +1,14 @@
+apiVersion: syncer.gkelabs.io/v1alpha1
+kind: KRMSyncer
+metadata:
+  name: basic-syncer
+  namespace: default
+spec:
+  destination:
+    clusterConfig:
+      kubeConfigSecretRef:
+        name: dest-kubeconfig
+  rules:
+  - group: e2e.gkelabs.io
+    version: v1alpha1
+    kind: TestCRD
