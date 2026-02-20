@@ -48,6 +48,7 @@ func TestKRMSyncerIntegration(t *testing.T) {
 	cfgA := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd"), filepath.Join("..", "integration", "testcrd")},
 		ErrorIfCRDPathMissing: true,
+		DownloadBinaryAssets:  true,
 	}
 	configA, err := cfgA.Start()
 	require.NoError(t, err)
@@ -61,6 +62,7 @@ func TestKRMSyncerIntegration(t *testing.T) {
 	cfgB := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "integration", "testcrd")},
 		ErrorIfCRDPathMissing: true,
+		DownloadBinaryAssets:  true,
 	}
 	configB, err := cfgB.Start()
 	require.NoError(t, err)
