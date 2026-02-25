@@ -4,7 +4,8 @@ metadata:
   name: basic-syncer
   namespace: default
 spec:
-  destination:
+  mode: push
+  remote:
     clusterConfig:
       kubeConfigSecretRef:
         name: dest-kubeconfig

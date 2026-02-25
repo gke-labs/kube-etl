@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.20.0
+    controller-gen.kubebuilder.io/version: v0.20.1
   name: krmsyncers.syncer.gkelabs.io
 spec:
   group: syncer.gkelabs.io
@@ -39,17 +39,24 @@ spec:
           spec:
             description: KRMSyncerSpec defines the desired state.
             properties:
-              destination:
-                description: Destination defines the target for the sync.
+              mode:
+                default: pull
+                description: 'Mode defines the sync mode: push or pull.'
+                enum:
+                - push
+                - pull
+                type: string
+              remote:
+                description: Remote defines the remote cluster for the sync.
                 properties:
                   clusterConfig:
                     description: ClusterConfig defines the configuration for syncing
-                      to a remote Kubernetes cluster.
+                      with a remote Kubernetes cluster.
                     properties:
                       kubeConfigSecretRef:
                         description: |-
                           KubeConfigSecretRef is the reference to the secret containing the
-                          kubeconfig of the destination cluster.
+                          kubeconfig of the remote cluster.
                         properties:
                           name:
                             description: name is unique within a namespace to reference
@@ -90,10 +97,6 @@ spec:
                         SyncFields is an optional list of fields to synchronize. If not provided, only the "status" field is synchronized.
                         Examples: "spec", "status", "spec.resourceID".
                       items:
-                        enum:
-                        - spec
-                        - status
-                        - spec.resourceID
                         type: string
                       type: array
                     version:
@@ -110,7 +113,7 @@ spec:
                 description: Suspend tells the controller to suspend the sync operations.
                 type: boolean
             required:
-            - destination
+            - remote
             - rules
             type: object
           status:

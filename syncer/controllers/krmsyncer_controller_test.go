@@ -165,7 +165,8 @@ func TestSyncerSync(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
 			Suspend: false,
-			Destination: &krmv1alpha1.DestinationConfig{
+			Mode:    krmv1alpha1.ModePush,
+			Remote: &krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
 				},
@@ -250,7 +251,8 @@ func TestSyncerSyncFields(t *testing.T) {
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
+			Mode: krmv1alpha1.ModePush,
+			Remote: &krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
 				},
@@ -329,7 +331,8 @@ func TestSyncerSyncStatusSubresource(t *testing.T) {
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
+			Mode: krmv1alpha1.ModePush,
+			Remote: &krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
 				},
@@ -380,7 +383,8 @@ func TestSyncerValidation(t *testing.T) {
 	validSyncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: "valid-syncer", Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
+			Mode: krmv1alpha1.ModePush,
+			Remote: &krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: "dummy", Namespace: ns},
 				},
@@ -395,32 +399,12 @@ func TestSyncerValidation(t *testing.T) {
 	}
 	assert.NoError(t, k8sClientSource.Create(ctx, validSyncer))
 
-	// Test case 2: Invalid syncFields
-	invalidSyncer := &krmv1alpha1.KRMSyncer{
-		ObjectMeta: metav1.ObjectMeta{Name: "invalid-syncer", Namespace: ns},
-		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: "dummy", Namespace: ns},
-				},
-			},
-			Rules: []krmv1alpha1.ResourceRule{
-				{
-					Group: "syncer.gkelabs.io", Version: "v1alpha1", Kind: "KRMSyncer",
-					SyncFields: []string{"invalid-field"},
-				},
-			},
-		},
-	}
-	err := k8sClientSource.Create(ctx, invalidSyncer)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "supported values: \"spec\", \"status\", \"spec.resourceID\"")
-
 	// Test case 3: Default value
 	defaultSyncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: "default-syncer", Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
+			Mode: krmv1alpha1.ModePush,
+			Remote: &krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: "dummy", Namespace: ns},
 				},
@@ -436,10 +420,97 @@ func TestSyncerValidation(t *testing.T) {
 	assert.Equal(t, []string{"status"}, defaultSyncer.Spec.Rules[0].SyncFields)
 }
 
+func TestSyncerPull(t *testing.T) {
+	ctx := t.Context()
+	ns := "default"
+	secretName := "remote-kubeconfig-pull"
+	syncerName := "test-syncer-pull"
+	targetServiceName := "target-service-pull"
+
+	// Generate kubeconfig from envtest Dest config (which acts as Remote in Pull mode)
+	remoteKubeconfigContent, err := createKubeconfig(cfgDest)
+	require.NoError(t, err)
+
+	// Create Secret in Source (Local) with Remote Kubeconfig
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
+		Data:       map[string][]byte{"kubeconfig": remoteKubeconfigContent},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, secret))
+
+	// Create Syncer in Pull mode
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode: krmv1alpha1.ModePull,
+			Remote: &krmv1alpha1.RemoteConfig{
+				ClusterConfig: &krmv1alpha1.ClusterConfig{
+					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
+				},
+			},
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"spec"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+
+	// Create target Service in Remote (cfgDest)
+	target := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 9090}},
+		},
+	}
+	require.NoError(t, k8sClientDest.Create(ctx, target))
+
+	// Verify Service Sync from Remote to Local (cfgSource)
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		localSvc := &corev1.Service{}
+		err := k8sClientSource.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, localSvc)
+		if err != nil {
+			return false, nil
+		}
+		return len(localSvc.Spec.Ports) > 0 && localSvc.Spec.Ports[0].Port == 9090, nil
+	})
+	assert.NoError(t, err, "Service should be pulled from remote to local")
+
+	// Update target Service in Remote
+	require.NoError(t, k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, target))
+	target.Spec.Ports[0].Port = 9091
+	require.NoError(t, k8sClientDest.Update(ctx, target))
+
+	// Verify Service Update Pulled to Local
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		localSvc := &corev1.Service{}
+		err := k8sClientSource.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, localSvc)
+		if err != nil {
+			return false, nil
+		}
+		return len(localSvc.Spec.Ports) > 0 && localSvc.Spec.Ports[0].Port == 9091, nil
+	})
+	assert.NoError(t, err, "Service update should be pulled to local")
+
+	// Delete target Service in Remote
+	require.NoError(t, k8sClientDest.Delete(ctx, target))
+
+	// Verify Deletion Pulled to Local
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		localSvc := &corev1.Service{}
+		err := k8sClientSource.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, localSvc)
+		return client.IgnoreNotFound(err) == nil && err != nil, nil
+	})
+	assert.NoError(t, err, "Service should be deleted from local")
+}
+
 func TestFilterFields(t *testing.T) {
 	dr := &DynamicResourceReconciler{
-		Client: nil,
-		GVK:    krmv1alpha1.GroupVersion.WithKind("KRMSyncer"),
+		LocalClient: nil,
+		GVK:         krmv1alpha1.GroupVersion.WithKind("KRMSyncer"),
 	}
 
 	src := &unstructured.Unstructured{
