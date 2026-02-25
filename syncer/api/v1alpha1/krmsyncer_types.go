@@ -34,24 +34,34 @@ type ResourceRule struct {
 	// SyncFields is an optional list of fields to synchronize. If not provided, only the "status" field is synchronized.
 	// Examples: "spec", "status", "spec.resourceID".
 	// +optional
-	// +kubebuilder:validation:Items:Enum=spec;status;spec.resourceID
+	// +kubebuilder:validation:items:Enum=spec;status;spec.resourceID
 	// +kubebuilder:default={"status"}
 	SyncFields []string `json:"syncFields,omitempty"`
 }
 
-// DestinationConfig defines where to push resources.
+// RemoteConfig defines the configuration for a sync endpoint.
 // +kubebuilder:object:generate=true
-type DestinationConfig struct {
-	// +optional
-	// ClusterConfig defines the configuration for syncing to a remote Kubernetes cluster.
-	ClusterConfig *ClusterConfig `json:"clusterConfig,omitempty"`
+type RemoteConfig struct {
+	// ClusterConfig defines the configuration for a remote Kubernetes cluster.
+	ClusterConfig *ClusterConfig `json:"clusterConfig"`
 }
 
 type ClusterConfig struct {
 	// KubeConfigSecretRef is the reference to the secret containing the
-	// kubeconfig of the destination cluster.
+	// kubeconfig of the remote cluster.
 	KubeConfigSecretRef *corev1.SecretReference `json:"kubeConfigSecretRef"`
 }
+
+// SyncMode defines the direction of synchronization.
+// +kubebuilder:validation:Enum=pull;push
+type SyncMode string
+
+const (
+	// Pull means synchronization from remote cluster to local cluster.
+	Pull SyncMode = "pull"
+	// Push means synchronization from local cluster to remote cluster.
+	Push SyncMode = "push"
+)
 
 // KRMSyncerSpec defines the desired state.
 // +kubebuilder:object:generate=true
@@ -60,8 +70,13 @@ type KRMSyncerSpec struct {
 	// +optional
 	Suspend bool `json:"suspend,omitempty"`
 
-	// Destination defines the target for the sync.
-	Destination *DestinationConfig `json:"destination"`
+	// SyncMode defines the sync direction.
+	// +optional
+	// +kubebuilder:default=pull
+	SyncMode SyncMode `json:"syncMode,omitempty"`
+
+	// Remote defines the remote cluster configuration.
+	Remote RemoteConfig `json:"remote"`
 
 	// Rules defines which resources to watch and sync. If unset, sync all resources by default.
 	Rules []ResourceRule `json:"rules"`

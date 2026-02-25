@@ -164,8 +164,9 @@ func TestSyncerSync(t *testing.T) {
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Suspend: false,
-			Destination: &krmv1alpha1.DestinationConfig{
+			Suspend:  false,
+			SyncMode: krmv1alpha1.Push,
+			Remote: krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
 				},
@@ -250,7 +251,8 @@ func TestSyncerSyncFields(t *testing.T) {
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
+			SyncMode: krmv1alpha1.Push,
+			Remote: krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
 				},
@@ -329,7 +331,8 @@ func TestSyncerSyncStatusSubresource(t *testing.T) {
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
+			SyncMode: krmv1alpha1.Push,
+			Remote: krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
 				},
@@ -380,7 +383,7 @@ func TestSyncerValidation(t *testing.T) {
 	validSyncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: "valid-syncer", Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
+			Remote: krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: "dummy", Namespace: ns},
 				},
@@ -399,7 +402,7 @@ func TestSyncerValidation(t *testing.T) {
 	invalidSyncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: "invalid-syncer", Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
+			Remote: krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: "dummy", Namespace: ns},
 				},
@@ -420,7 +423,7 @@ func TestSyncerValidation(t *testing.T) {
 	defaultSyncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: "default-syncer", Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Destination: &krmv1alpha1.DestinationConfig{
+			Remote: krmv1alpha1.RemoteConfig{
 				ClusterConfig: &krmv1alpha1.ClusterConfig{
 					KubeConfigSecretRef: &corev1.SecretReference{Name: "dummy", Namespace: ns},
 				},
@@ -437,11 +440,6 @@ func TestSyncerValidation(t *testing.T) {
 }
 
 func TestFilterFields(t *testing.T) {
-	dr := &DynamicResourceReconciler{
-		Client: nil,
-		GVK:    krmv1alpha1.GroupVersion.WithKind("KRMSyncer"),
-	}
-
 	src := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "syncer.gkelabs.io/v1alpha1",
@@ -468,7 +466,7 @@ func TestFilterFields(t *testing.T) {
 
 	// Test case 1: Sync spec.resourceID and status
 	fields := []string{"spec.resourceID", "status"}
-	dest, err := dr.filterFields(src, fields)
+	dest, err := filterFields(src, fields)
 	assert.NoError(t, err)
 
 	val, found, _ := unstructured.NestedString(dest.Object, "spec", "resourceID")
@@ -515,7 +513,7 @@ func TestFilterFields(t *testing.T) {
 		},
 	}
 	fieldsFull := []string{"spec"}
-	destFull, err := dr.filterFields(srcFull, fieldsFull)
+	destFull, err := filterFields(srcFull, fieldsFull)
 	assert.NoError(t, err)
 
 	spec, found, _ := unstructured.NestedMap(destFull.Object, "spec")
