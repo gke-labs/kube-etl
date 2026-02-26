@@ -22,20 +22,18 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/client-go/rest"
-	"sync"
-
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	toolswatch "k8s.io/client-go/tools/watch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/cluster"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
+	"sync"
 )
 
 // KRMSyncerReconciler reconciles a KRMSyncer object
@@ -130,16 +128,16 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // WatcherManager manages multiple clusters and their dynamic watchers
 type WatcherManager struct {
 	manager.Manager
-	mu       sync.RWMutex
-	clusters map[string]cluster.Cluster
-	watchers map[string]bool
+	mu             sync.RWMutex
+	dynamicClients map[string]dynamic.Interface
+	watchers       map[string]context.CancelFunc
 }
 
 func NewWatcherManager(mgr ctrl.Manager) *WatcherManager {
 	return &WatcherManager{
-		Manager:  mgr,
-		clusters: make(map[string]cluster.Cluster),
-		watchers: make(map[string]bool),
+		Manager:        mgr,
+		dynamicClients: make(map[string]dynamic.Interface),
+		watchers:       make(map[string]context.CancelFunc),
 	}
 }
 
@@ -153,92 +151,94 @@ func (wm *WatcherManager) EnsureWatcher(ctx context.Context, restConfig *rest.Co
 	}
 
 	watcherKey := fmt.Sprintf("%s/%s", clusterID, gvk.String())
-	if wm.watchers[watcherKey] {
+	if _, ok := wm.watchers[watcherKey]; ok {
 		return nil
 	}
 
-	// Get or Create Cluster
-	var c cluster.Cluster
-	if clusterID == "local" {
-		c = wm.Manager
-	} else {
-		var ok bool
-		c, ok = wm.clusters[clusterID]
-		if !ok {
-			var err error
-			c, err = cluster.New(restConfig, func(o *cluster.Options) {
-				o.Scheme = wm.GetScheme()
-			})
-			if err != nil {
-				return fmt.Errorf("failed to create cluster for %s: %v", clusterID, err)
-			}
-			if err := wm.Add(c); err != nil {
-				return fmt.Errorf("failed to add cluster to manager: %v", err)
-			}
-			wm.clusters[clusterID] = c
+	// Get or Create Dynamic Client
+	dynClient, ok := wm.dynamicClients[clusterID]
+	if !ok {
+		var err error
+		if restConfig == nil {
+			restConfig = wm.GetConfig()
 		}
+		dynClient, err = dynamic.NewForConfig(restConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create dynamic client for %s: %v", clusterID, err)
+		}
+		wm.dynamicClients[clusterID] = dynClient
 	}
 
-	// Create Controller
-	reconciler := &DynamicResourceReconciler{
-		LocalClient:  wm.GetClient(),
-		SourceClient: c.GetClient(),
-		SourceID:     clusterID,
-		GVK:          gvk,
-	}
-
-	ctrlName := fmt.Sprintf("dynamic-watcher-%s-%s-%s-%s", clusterID, gvk.Group, gvk.Version, gvk.Kind)
-	if len(ctrlName) > 63 {
-		ctrlName = ctrlName[:63]
-	}
-
-	con, err := controller.New(ctrlName, wm.Manager, controller.Options{
-		Reconciler: reconciler,
-	})
+	// Resolve GVR
+	mapping, err := wm.GetRESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version)
 	if err != nil {
-		return fmt.Errorf("failed to create controller %s: %v", ctrlName, err)
+		return fmt.Errorf("failed to resolve GVR for %v: %v", gvk, err)
+	}
+	gvr := mapping.Resource
+
+	// Create Watcher
+	lw := &cache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return dynClient.Resource(gvr).List(ctx, options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return dynClient.Resource(gvr).Watch(ctx, options)
+		},
 	}
 
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(gvk)
-
-	err = con.Watch(source.Kind(c.GetCache(), u, &handler.TypedEnqueueRequestForObject[*unstructured.Unstructured]{}))
+	rw, err := toolswatch.NewRetryWatcher("1", lw)
 	if err != nil {
-		return fmt.Errorf("failed to watch %v on cluster %s: %v", gvk, clusterID, err)
+		return fmt.Errorf("failed to create retry watcher for %v: %v", gvk, err)
 	}
 
-	wm.watchers[watcherKey] = true
+	watchCtx, cancel := context.WithCancel(context.Background())
+	wm.watchers[watcherKey] = cancel
+
+	go func() {
+		defer rw.Stop()
+		logger := log.FromContext(context.Background()).WithValues("gvk", gvk, "cluster", clusterID)
+		logger.Info("Starting lightweight watcher")
+
+		for {
+			select {
+			case <-watchCtx.Done():
+				logger.Info("Stopping watcher")
+				return
+			case event, ok := <-rw.ResultChan():
+				if !ok {
+					logger.Info("Watcher channel closed, restarting")
+					return
+				}
+				if event.Type == watch.Error {
+					logger.Error(fmt.Errorf("watcher error: %v", event.Object), "Watcher error")
+					continue
+				}
+				if event.Type == watch.Bookmark {
+					continue
+				}
+
+				wm.handleEvent(watchCtx, event, clusterID, gvk)
+			}
+		}
+	}()
+
 	return nil
 }
 
-// DynamicResourceReconciler handles events for dynamically watched resources
-type DynamicResourceReconciler struct {
-	LocalClient  client.Client
-	SourceClient client.Client
-	SourceID     string // "local" or Remote Host
-	GVK          schema.GroupVersionKind
-}
-
-func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+func (wm *WatcherManager) handleEvent(ctx context.Context, event watch.Event, sourceID string, gvk schema.GroupVersionKind) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the resource from Source cluster
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(r.GVK)
-	err := r.SourceClient.Get(ctx, req.NamespacedName, u)
-	isDeleted := false
-	if err != nil {
-		if client.IgnoreNotFound(err) == nil {
-			isDeleted = true
-		} else {
-			return reconcile.Result{}, err
-		}
+	u, ok := event.Object.(*unstructured.Unstructured)
+	if !ok {
+		logger.Error(fmt.Errorf("event object is not unstructured: %T", event.Object), "Invalid event object")
+		return
 	}
 
 	// Fetch all Syncers from Local cluster to find matching rules (Active ones)
 	var krmsyncers krmv1alpha1.KRMSyncerList
-	if err := r.LocalClient.List(ctx, &krmsyncers); err != nil {
-		return reconcile.Result{}, err
+	if err := wm.GetClient().List(ctx, &krmsyncers); err != nil {
+		logger.Error(err, "Failed to list KRMSyncers")
+		return
 	}
 
 	for _, krmsyncer := range krmsyncers.Items {
@@ -247,48 +247,49 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req reconcile
 		}
 
 		var targetClient client.Client
+		var err error
 
-		if krmsyncer.Spec.SyncMode == krmv1alpha1.Push && r.SourceID == "local" {
+		if krmsyncer.Spec.SyncMode == krmv1alpha1.Push && sourceID == "local" {
 			// Push Mode: watch local, sync to remote
-			targetClient, err = getRemoteClient(ctx, r.LocalClient, krmsyncer.Namespace, &krmsyncer.Spec.Remote)
+			targetClient, err = getRemoteClient(ctx, wm.GetClient(), krmsyncer.Namespace, &krmsyncer.Spec.Remote)
 			if err != nil {
 				logger.Error(err, "Failed to get remote client for Push")
 				continue
 			}
-		} else if krmsyncer.Spec.SyncMode == krmv1alpha1.Pull && r.SourceID != "local" {
+		} else if krmsyncer.Spec.SyncMode == krmv1alpha1.Pull && sourceID != "local" {
 			// Pull Mode: watch remote, sync to local
-			remoteConfig, err := getRemoteConfig(ctx, r.LocalClient, krmsyncer.Namespace, &krmsyncer.Spec.Remote)
+			remoteConfig, err := getRemoteConfig(ctx, wm.GetClient(), krmsyncer.Namespace, &krmsyncer.Spec.Remote)
 			if err != nil {
 				logger.Error(err, "Failed to get remote config for Pull")
 				continue
 			}
-			if remoteConfig.Host != r.SourceID {
+			if remoteConfig.Host != sourceID {
 				continue
 			}
-			targetClient = r.LocalClient
+			targetClient = wm.GetClient()
 		} else {
 			continue
 		}
 
 		for _, rule := range krmsyncer.Spec.Rules {
 			// Check GVK match
-			if rule.Group != r.GVK.Group || rule.Version != r.GVK.Version || rule.Kind != r.GVK.Kind {
+			if rule.Group != gvk.Group || rule.Version != gvk.Version || rule.Kind != gvk.Kind {
 				continue
 			}
 
 			// Check Namespace match
-			if !isNamespaceMatched(req.Namespace, rule.Namespaces) {
+			if !isNamespaceMatched(u.GetNamespace(), rule.Namespaces) {
 				continue
 			}
 
 			// Handle Deletion
-			if isDeleted {
+			if event.Type == watch.Deleted {
 				toDelete := &unstructured.Unstructured{}
-				toDelete.SetGroupVersionKind(r.GVK)
-				toDelete.SetName(req.Name)
-				toDelete.SetNamespace(req.Namespace)
+				toDelete.SetGroupVersionKind(gvk)
+				toDelete.SetName(u.GetName())
+				toDelete.SetNamespace(u.GetNamespace())
 
-				logger.Info("Deleting resource on target cluster", "name", req.Name, "namespace", req.Namespace)
+				logger.Info("Deleting resource on target cluster", "name", u.GetName(), "namespace", u.GetNamespace())
 				if err := targetClient.Delete(ctx, toDelete); err != nil {
 					if !errors.IsNotFound(err) {
 						logger.Error(err, "Failed to delete resource on target cluster")
@@ -318,5 +319,4 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req reconcile
 			}
 		}
 	}
-	return reconcile.Result{}, nil
 }
