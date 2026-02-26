@@ -1,9 +1,10 @@
 apiVersion: syncer.gkelabs.io/v1alpha1
 kind: KRMSyncer
 metadata:
-  name: spec-syncer
+  name: pull-syncer
   namespace: default
 spec:
+  syncMode: push
   remote:
     clusterConfig:
       kubeConfigSecretRef:
@@ -12,4 +13,3 @@ spec:
   - group: e2e.gkelabs.io
     version: v1alpha1
     kind: TestCRD
-    syncFields: ["spec", "status"]

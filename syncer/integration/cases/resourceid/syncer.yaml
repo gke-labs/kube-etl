@@ -4,11 +4,10 @@ metadata:
   name: resourceid-syncer
   namespace: default
 spec:
-  syncMode: push
   remote:
     clusterConfig:
       kubeConfigSecretRef:
-        name: dest-kubeconfig
+        name: remote-kubeconfig
   rules:
   - group: e2e.gkelabs.io
     version: v1alpha1

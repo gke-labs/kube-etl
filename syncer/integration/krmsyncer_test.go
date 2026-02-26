@@ -43,36 +43,36 @@ func TestKRMSyncerIntegration(t *testing.T) {
 	testScheme := scheme.Scheme
 	require.NoError(t, krmv1alpha1.AddToScheme(testScheme))
 
-	// Cluster A
-	t.Log("Starting Cluster A...")
-	cfgA := &envtest.Environment{
+	// Local Cluster - where the controller runs
+	t.Log("Starting Local Cluster...")
+	cfgLocal := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd"), filepath.Join("..", "integration", "testcrd")},
 		ErrorIfCRDPathMissing: true,
 		DownloadBinaryAssets:  true,
 	}
-	configA, err := cfgA.Start()
+	configA, err := cfgLocal.Start()
 	require.NoError(t, err)
-	defer cfgA.Stop()
+	defer cfgLocal.Stop()
 
-	k8sClientA, err := client.New(configA, client.Options{Scheme: testScheme})
+	k8sClientLocal, err := client.New(configA, client.Options{Scheme: testScheme})
 	require.NoError(t, err)
 
-	// Cluster B
-	t.Log("Starting Cluster B...")
+	// Remote Cluster
+	t.Log("Starting Remote Cluster ...")
 	cfgB := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "integration", "testcrd")},
 		ErrorIfCRDPathMissing: true,
 		DownloadBinaryAssets:  true,
 	}
-	configB, err := cfgB.Start()
+	configRemote, err := cfgB.Start()
 	require.NoError(t, err)
 	defer cfgB.Stop()
 
-	k8sClientB, err := client.New(configB, client.Options{Scheme: testScheme})
+	k8sClientRemote, err := client.New(configRemote, client.Options{Scheme: testScheme})
 	require.NoError(t, err)
 
-	// 2. Start Manager for Cluster A
-	t.Log("Starting Manager on Cluster A...")
+	// 2. Start Manager for Local Cluster
+	t.Log("Starting Manager on Local Cluster...")
 	mgr, err := ctrl.NewManager(configA, ctrl.Options{
 		Scheme:  testScheme,
 		Metrics: metricsserver.Options{BindAddress: "0"},
@@ -95,21 +95,21 @@ func TestKRMSyncerIntegration(t *testing.T) {
 		}
 	}()
 
-	// 3. Setup Synchronization (Kubeconfig Secret)
-	t.Log("Creating Kubeconfig Secret...")
-	destKubeconfig, err := createKubeconfig(configB)
+	// 3. Setup Synchronization (Kubeconfig for Remote Cluster)
+	t.Log("Creating Remote Kubeconfig Secret...")
+	remoteKubeconfig, err := createKubeconfig(configRemote)
 	require.NoError(t, err)
 
 	secret := &corev1.Secret{
 		ObjectMeta: ctrl.ObjectMeta{
-			Name:      "dest-kubeconfig",
+			Name:      "remote-kubeconfig",
 			Namespace: "default",
 		},
 		Data: map[string][]byte{
-			"kubeconfig": destKubeconfig,
+			"kubeconfig": remoteKubeconfig,
 		},
 	}
-	require.NoError(t, k8sClientA.Create(ctx, secret))
+	require.NoError(t, k8sClientLocal.Create(ctx, secret))
 
 	// 4. Run Test Cases
 	casesDir := "../integration/cases"
@@ -122,12 +122,12 @@ func TestKRMSyncerIntegration(t *testing.T) {
 		}
 		caseName := d.Name()
 		t.Run(caseName, func(t *testing.T) {
-			runTestCase(t, ctx, k8sClientA, k8sClientB, filepath.Join(casesDir, caseName))
+			runTestCase(t, ctx, k8sClientLocal, k8sClientRemote, filepath.Join(casesDir, caseName))
 		})
 	}
 }
 
-func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Client, caseDir string) {
+func runTestCase(t *testing.T, ctx context.Context, localClient, remoteClient client.Client, caseDir string) {
 	t.Logf("Running test case: %s", filepath.Base(caseDir))
 
 	// Load Syncer
@@ -136,16 +136,26 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 	syncer := &krmv1alpha1.KRMSyncer{}
 	require.NoError(t, yaml.Unmarshal(syncerBytes, syncer))
 
+	// Determine Source and Destination clients
+	var sourceClient, destClient client.Client
+	if syncer.Spec.SyncMode == krmv1alpha1.Push {
+		sourceClient = localClient
+		destClient = remoteClient
+	} else {
+		sourceClient = remoteClient
+		destClient = localClient
+	}
+
 	// Clean up Syncer at end of test
 	defer func() {
-		_ = clientA.Delete(ctx, syncer)
+		_ = localClient.Delete(ctx, syncer)
 	}()
 
 	// Start the Syncer
-	require.NoError(t, clientA.Create(ctx, syncer))
+	require.NoError(t, localClient.Create(ctx, syncer))
 
-	// Create Resource in A
-	createBytes, err := ioutil.ReadFile("../integration/testdata/object.yaml") // Default create
+	// Create Resource in Source
+	createBytes, err := ioutil.ReadFile("../integration/testdata/object.yaml")
 	require.NoError(t, err)
 	resource := &unstructured.Unstructured{}
 	require.NoError(t, yaml.Unmarshal(createBytes, resource))
@@ -156,19 +166,19 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 
 	// Clean up Resource at end of test
 	defer func() {
-		_ = clientA.Delete(ctx, resource)
-		_ = clientB.Delete(ctx, resource) // Cleanup on B too just in case
+		_ = sourceClient.Delete(ctx, resource)
+		_ = destClient.Delete(ctx, resource)
 	}()
 
-	t.Log("Creating Resource in Cluster A...")
-	require.NoError(t, clientA.Create(ctx, resource))
+	t.Log("Creating Resource in Source Cluster...")
+	require.NoError(t, sourceClient.Create(ctx, resource))
 
-	// Update Status in A
+	// Update Status in Source
 	if hasStatus {
 		statusObj := resource.DeepCopy()
 		err := unstructured.SetNestedField(statusObj.Object, initialStatus, "status")
 		require.NoError(t, err)
-		require.NoError(t, clientA.Status().Update(ctx, statusObj))
+		require.NoError(t, sourceClient.Status().Update(ctx, statusObj))
 	}
 
 	// Sleep to allow resource to sync
@@ -181,10 +191,10 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 		expected := &unstructured.Unstructured{}
 		require.NoError(t, yaml.Unmarshal(expectedBytes, expected))
 
-		t.Log("Verifying expected resource in Cluster B...")
+		t.Log("Verifying expected resource in Destination Cluster...")
 		actual := &unstructured.Unstructured{}
 		actual.SetGroupVersionKind(resource.GroupVersionKind())
-		err := clientB.Get(ctx, client.ObjectKeyFromObject(resource), actual)
+		err := destClient.Get(ctx, client.ObjectKeyFromObject(resource), actual)
 		require.NoError(t, err)
 
 		// Compare Spec
@@ -202,7 +212,7 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 		t.Log("Verifying resource does NOT exist in Cluster B...")
 		actual := &unstructured.Unstructured{}
 		actual.SetGroupVersionKind(resource.GroupVersionKind())
-		err := clientB.Get(ctx, client.ObjectKeyFromObject(resource), actual)
+		err := destClient.Get(ctx, client.ObjectKeyFromObject(resource), actual)
 		assert.True(t, errors.IsNotFound(err), "Resource should not exist in Cluster B")
 	}
 }
