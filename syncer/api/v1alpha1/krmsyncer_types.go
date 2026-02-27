@@ -39,17 +39,27 @@ type ResourceRule struct {
 	SyncFields []string `json:"syncFields,omitempty"`
 }
 
-// DestinationConfig defines where to push resources.
+// Mode defines the synchronization mode.
+type Mode string
+
+const (
+	// ModePush means the syncer watches resources on the local cluster and pushes them to the remote cluster.
+	ModePush Mode = "push"
+	// ModePull means the syncer watches resources on the remote cluster and pulls them to the local cluster.
+	ModePull Mode = "pull"
+)
+
+// RemoteConfig defines the remote cluster configuration.
 // +kubebuilder:object:generate=true
-type DestinationConfig struct {
+type RemoteConfig struct {
 	// +optional
-	// ClusterConfig defines the configuration for syncing to a remote Kubernetes cluster.
+	// ClusterConfig defines the configuration for syncing with a remote Kubernetes cluster.
 	ClusterConfig *ClusterConfig `json:"clusterConfig,omitempty"`
 }
 
 type ClusterConfig struct {
 	// KubeConfigSecretRef is the reference to the secret containing the
-	// kubeconfig of the destination cluster.
+	// kubeconfig of the remote cluster.
 	KubeConfigSecretRef *corev1.SecretReference `json:"kubeConfigSecretRef"`
 }
 
@@ -60,8 +70,14 @@ type KRMSyncerSpec struct {
 	// +optional
 	Suspend bool `json:"suspend,omitempty"`
 
-	// Destination defines the target for the sync.
-	Destination *DestinationConfig `json:"destination"`
+	// Mode defines the sync mode: push or pull.
+	// +optional
+	// +kubebuilder:validation:Enum=push;pull
+	// +kubebuilder:default=pull
+	Mode Mode `json:"mode,omitempty"`
+
+	// Remote defines the remote cluster for the sync.
+	Remote *RemoteConfig `json:"remote"`
 
 	// Rules defines which resources to watch and sync. If unset, sync all resources by default.
 	Rules []ResourceRule `json:"rules"`

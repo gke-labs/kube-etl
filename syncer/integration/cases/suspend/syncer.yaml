@@ -5,7 +5,8 @@ metadata:
   namespace: default
 spec:
   suspend: true
-  destination:
+  mode: push
+  remote:
     clusterConfig:
       kubeConfigSecretRef:
         name: dest-kubeconfig
