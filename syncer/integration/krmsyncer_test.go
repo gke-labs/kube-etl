@@ -144,7 +144,15 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 	// Start the Syncer
 	require.NoError(t, clientA.Create(ctx, syncer))
 
-	// Create Resource in A
+	// Determine Source and Destination clients based on mode
+	sourceClient := clientA
+	destClient := clientB
+	if syncer.Spec.Mode == krmv1alpha1.ModePull {
+		sourceClient = clientB
+		destClient = clientA
+	}
+
+	// Create Resource in Source
 	createBytes, err := ioutil.ReadFile("../integration/testdata/object.yaml") // Default create
 	require.NoError(t, err)
 	resource := &unstructured.Unstructured{}
@@ -157,18 +165,18 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 	// Clean up Resource at end of test
 	defer func() {
 		_ = clientA.Delete(ctx, resource)
-		_ = clientB.Delete(ctx, resource) // Cleanup on B too just in case
+		_ = clientB.Delete(ctx, resource) // Cleanup on both just in case
 	}()
 
-	t.Log("Creating Resource in Cluster A...")
-	require.NoError(t, clientA.Create(ctx, resource))
+	t.Logf("Creating Resource in Source Cluster (Mode: %s)...", syncer.Spec.Mode)
+	require.NoError(t, sourceClient.Create(ctx, resource))
 
-	// Update Status in A
+	// Update Status in Source
 	if hasStatus {
 		statusObj := resource.DeepCopy()
 		err := unstructured.SetNestedField(statusObj.Object, initialStatus, "status")
 		require.NoError(t, err)
-		require.NoError(t, clientA.Status().Update(ctx, statusObj))
+		require.NoError(t, sourceClient.Status().Update(ctx, statusObj))
 	}
 
 	// Sleep to allow resource to sync
@@ -181,10 +189,10 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 		expected := &unstructured.Unstructured{}
 		require.NoError(t, yaml.Unmarshal(expectedBytes, expected))
 
-		t.Log("Verifying expected resource in Cluster B...")
+		t.Log("Verifying expected resource in Destination Cluster...")
 		actual := &unstructured.Unstructured{}
 		actual.SetGroupVersionKind(resource.GroupVersionKind())
-		err := clientB.Get(ctx, client.ObjectKeyFromObject(resource), actual)
+		err := destClient.Get(ctx, client.ObjectKeyFromObject(resource), actual)
 		require.NoError(t, err)
 
 		// Compare Spec
@@ -199,11 +207,11 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 
 	} else {
 		// Expect Not Found (Suspend case)
-		t.Log("Verifying resource does NOT exist in Cluster B...")
+		t.Log("Verifying resource does NOT exist in Destination Cluster...")
 		actual := &unstructured.Unstructured{}
 		actual.SetGroupVersionKind(resource.GroupVersionKind())
-		err := clientB.Get(ctx, client.ObjectKeyFromObject(resource), actual)
-		assert.True(t, errors.IsNotFound(err), "Resource should not exist in Cluster B")
+		err := destClient.Get(ctx, client.ObjectKeyFromObject(resource), actual)
+		assert.True(t, errors.IsNotFound(err), "Resource should not exist in Destination Cluster")
 	}
 }
 

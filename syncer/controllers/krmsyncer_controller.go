@@ -108,7 +108,7 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 
 	mode := krmsyncer.Spec.Mode
 	if mode == "" {
-		mode = krmv1alpha1.ModePush // Default to push for backward compatibility if needed, but the API says default is pull. Actually let's use what's in the spec.
+		mode = krmv1alpha1.ModePull
 	}
 
 	for _, rule := range krmsyncer.Spec.Rules {
@@ -153,7 +153,7 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.GroupVersionKind) error {
 	dr := &DynamicResourceReconciler{
 		LocalClient:  r.Client,
-		SourceClient: r.Client,
+		RemoteClient: r.Client,
 		GVK:          gvk,
 		Mode:         krmv1alpha1.ModePush,
 	}
@@ -175,7 +175,7 @@ func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer 
 
 	dr := &DynamicResourceReconciler{
 		LocalClient:  r.Client,
-		SourceClient: remoteCluster.GetClient(),
+		RemoteClient: remoteCluster.GetClient(),
 		GVK:          gvk,
 		Mode:         krmv1alpha1.ModePull,
 		Remote: RemoteGVK{
@@ -256,7 +256,7 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // DynamicResourceReconciler handles events for dynamically watched resources
 type DynamicResourceReconciler struct {
 	LocalClient  client.Client
-	SourceClient client.Client
+	RemoteClient client.Client
 	GVK          schema.GroupVersionKind
 	Mode         krmv1alpha1.Mode
 	Remote       RemoteGVK // Only used for Pull mode
@@ -268,7 +268,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// Fetch the resource from Source cluster
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(r.GVK)
-	err := r.SourceClient.Get(ctx, req.NamespacedName, u)
+	err := r.RemoteClient.Get(ctx, req.NamespacedName, u)
 	isDeleted := false
 	if err != nil {
 		if client.IgnoreNotFound(err) == nil {
@@ -292,7 +292,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// Check Mode match
 		syncerMode := krmsyncer.Spec.Mode
 		if syncerMode == "" {
-			syncerMode = krmv1alpha1.ModePush
+			syncerMode = krmv1alpha1.ModePull
 		}
 		if syncerMode != r.Mode {
 			continue

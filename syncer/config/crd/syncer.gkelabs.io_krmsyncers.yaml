@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.20.1
+    controller-gen.kubebuilder.io/version: v0.20.0
   name: krmsyncers.syncer.gkelabs.io
 spec:
   group: syncer.gkelabs.io
@@ -97,6 +97,10 @@ spec:
                         SyncFields is an optional list of fields to synchronize. If not provided, only the "status" field is synchronized.
                         Examples: "spec", "status", "spec.resourceID".
                       items:
+                        enum:
+                        - spec
+                        - status
+                        - spec.resourceID
                         type: string
                       type: array
                     version:
