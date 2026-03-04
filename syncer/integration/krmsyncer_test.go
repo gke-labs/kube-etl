@@ -15,6 +15,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/gke-labs/kube-etl/syncer/controllers"
@@ -29,6 +30,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"os"
+	"os/exec"
 	"path/filepath"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,6 +40,17 @@ import (
 	"testing"
 	"time"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		cmd := exec.Command("go", "run", "sigs.k8s.io/controller-runtime/tools/setup-envtest@latest", "use", "-p", "path")
+		out, err := cmd.Output()
+		if err == nil && len(out) > 0 {
+			os.Setenv("KUBEBUILDER_ASSETS", string(bytes.TrimSpace(out)))
+		}
+	}
+	os.Exit(m.Run())
+}
 
 func TestKRMSyncerIntegration(t *testing.T) {
 	// 1. Setup Environments
@@ -48,7 +62,6 @@ func TestKRMSyncerIntegration(t *testing.T) {
 	cfgA := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd"), filepath.Join("..", "integration", "testcrd")},
 		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
 	}
 	configA, err := cfgA.Start()
 	require.NoError(t, err)
@@ -62,7 +75,6 @@ func TestKRMSyncerIntegration(t *testing.T) {
 	cfgB := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "integration", "testcrd")},
 		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
 	}
 	configB, err := cfgB.Start()
 	require.NoError(t, err)

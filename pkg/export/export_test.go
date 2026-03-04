@@ -16,7 +16,9 @@ package export
 
 import (
 	"archive/zip"
+	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -25,11 +27,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
+func TestMain(m *testing.M) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		cmd := exec.Command("go", "run", "sigs.k8s.io/controller-runtime/tools/setup-envtest@latest", "use", "-p", "path")
+		out, err := cmd.Output()
+		if err == nil && len(out) > 0 {
+			os.Setenv("KUBEBUILDER_ASSETS", string(bytes.TrimSpace(out)))
+		}
+	}
+	os.Exit(m.Run())
+}
+
 func TestExport(t *testing.T) {
 	// 1. Setup envtest
-	testEnv := &envtest.Environment{
-		DownloadBinaryAssets: true,
-	}
+	testEnv := &envtest.Environment{}
 
 	cfg, err := testEnv.Start()
 	if err != nil {

@@ -15,12 +15,14 @@
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/client-go/rest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"testing"
@@ -54,6 +56,13 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		cmd := exec.Command("go", "run", "sigs.k8s.io/controller-runtime/tools/setup-envtest@latest", "use", "-p", "path")
+		out, err := cmd.Output()
+		if err == nil && len(out) > 0 {
+			os.Setenv("KUBEBUILDER_ASSETS", string(bytes.TrimSpace(out)))
+		}
+	}
 	ctrl.SetLogger(klog.NewKlogr())
 	mgrCtx, mgrCancel = context.WithCancel(ctrl.SetupSignalHandler())
 
@@ -61,7 +70,6 @@ func TestMain(m *testing.M) {
 	testEnvSource = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
 	}
 	var err error
 	cfgSource, err = testEnvSource.Start()
@@ -74,7 +82,6 @@ func TestMain(m *testing.M) {
 	testEnvDest = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
 	}
 	cfgDest, err = testEnvDest.Start()
 	if err != nil {
