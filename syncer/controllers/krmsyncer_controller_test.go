@@ -61,7 +61,6 @@ func TestMain(m *testing.M) {
 	testEnvSource = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
 	}
 	var err error
 	cfgSource, err = testEnvSource.Start()
@@ -74,7 +73,6 @@ func TestMain(m *testing.M) {
 	testEnvDest = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
 		ErrorIfCRDPathMissing: true,
-		DownloadBinaryAssets:  true,
 	}
 	cfgDest, err = testEnvDest.Start()
 	if err != nil {

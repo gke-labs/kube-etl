@@ -27,9 +27,7 @@ import (
 
 func TestExport(t *testing.T) {
 	// 1. Setup envtest
-	testEnv := &envtest.Environment{
-		DownloadBinaryAssets: true,
-	}
+	testEnv := &envtest.Environment{}
 
 	cfg, err := testEnv.Start()
 	if err != nil {
