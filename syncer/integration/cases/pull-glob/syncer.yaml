@@ -1,0 +1,17 @@
+apiVersion: syncer.gkelabs.io/v1alpha1
+kind: KRMSyncer
+metadata:
+  name: pull-glob
+  namespace: default
+spec:
+  mode: pull
+  remote:
+    clusterConfig:
+      kubeConfigSecretRef:
+        name: dest-kubeconfig
+  rules:
+  - group: "*.cnrm.cloud.google.com"
+    version: "*"
+    kind: "*"
+    namespaces: ["default"]
+    syncFields: ["spec"]

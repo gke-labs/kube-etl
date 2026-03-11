@@ -22,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"strings"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -104,8 +105,11 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 func (r *KRMSyncerReconciler) validateRule(rule krmv1alpha1.ResourceRule) error {
 	hasGlob := strings.Contains(rule.Group, "*") || strings.Contains(rule.Version, "*") || strings.Contains(rule.Kind, "*")
 	if hasGlob {
-		if rule.Group != "*.cnrm.cloud.google.com" || rule.Version != "*" || rule.Kind != "*" {
-			return fmt.Errorf("globbing ('*') is only allowed for version and kind if group is exactly '*.cnrm.cloud.google.com'")
+		isKCC := rule.Group == "*.cnrm.cloud.google.com" ||
+			strings.HasSuffix(rule.Group, ".cnrm.cloud.google.com") ||
+			rule.Group == "cnrm.cloud.google.com"
+		if !isKCC || rule.Version != "*" || rule.Kind != "*" {
+			return fmt.Errorf("globbing ('*') is only allowed for version and kind if group is KCC (e.g. *.cnrm.cloud.google.com)")
 		}
 	}
 	return nil
@@ -117,6 +121,10 @@ func (r *KRMSyncerReconciler) getDiscoveryClient(ctx context.Context, krmsyncer 
 	}
 
 	// Pull mode
+	if krmsyncer.Spec.Remote == nil || krmsyncer.Spec.Remote.ClusterConfig == nil || krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef == nil {
+		return nil, fmt.Errorf("remote cluster config missing for Pull mode")
+	}
+
 	secret := &corev1.Secret{}
 	secretKey := client.ObjectKey{
 		Name:      krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name,
@@ -135,34 +143,39 @@ func (r *KRMSyncerReconciler) getDiscoveryClient(ctx context.Context, krmsyncer 
 	if err != nil {
 		return nil, err
 	}
+	restConfig.Timeout = 10 * time.Second
 
 	return discovery.NewDiscoveryClientForConfig(restConfig)
 }
 
-func (r *KRMSyncerReconciler) expandRule(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, rule krmv1alpha1.ResourceRule, mode krmv1alpha1.Mode) ([]schema.GroupVersionKind, error) {
+func (r *KRMSyncerReconciler) expandRule(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, rule krmv1alpha1.ResourceRule, mode krmv1alpha1.Mode, resourceLists []*metav1.APIResourceList) ([]schema.GroupVersionKind, error) {
 	if err := r.validateRule(rule); err != nil {
 		return nil, err
 	}
 
-	if rule.Group == "*.cnrm.cloud.google.com" && rule.Version == "*" && rule.Kind == "*" {
-		dc, err := r.getDiscoveryClient(ctx, krmsyncer, mode)
-		if err != nil {
-			return nil, err
-		}
-		resourceLists, err := dc.ServerPreferredResources()
-		if err != nil {
-			return nil, err
-		}
+	isKCCGlob := (rule.Group == "*.cnrm.cloud.google.com" ||
+		strings.HasSuffix(rule.Group, ".cnrm.cloud.google.com") ||
+		rule.Group == "cnrm.cloud.google.com") && rule.Version == "*" && rule.Kind == "*"
 
+	if isKCCGlob {
 		var gvks []schema.GroupVersionKind
 		for _, rl := range resourceLists {
 			gv, err := schema.ParseGroupVersion(rl.GroupVersion)
 			if err != nil {
 				continue
 			}
-			if !strings.HasSuffix(gv.Group, ".cnrm.cloud.google.com") {
+			// Match group
+			groupMatch := false
+			if rule.Group == "*.cnrm.cloud.google.com" {
+				groupMatch = strings.HasSuffix(gv.Group, "cnrm.cloud.google.com")
+			} else {
+				groupMatch = (gv.Group == rule.Group)
+			}
+
+			if !groupMatch {
 				continue
 			}
+
 			for _, res := range rl.APIResources {
 				// Avoid subresources
 				if strings.Contains(res.Name, "/") {
@@ -196,8 +209,32 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 		mode = krmv1alpha1.ModePull
 	}
 
+	var resourceLists []*metav1.APIResourceList
+	needsExpansion := false
 	for _, rule := range krmsyncer.Spec.Rules {
-		gvks, err := r.expandRule(ctx, krmsyncer, rule, mode)
+		if strings.Contains(rule.Group, "*") || strings.Contains(rule.Version, "*") || strings.Contains(rule.Kind, "*") {
+			needsExpansion = true
+			break
+		}
+	}
+
+	if needsExpansion {
+		dc, err := r.getDiscoveryClient(ctx, krmsyncer, mode)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		// Use ServerGroupsAndResources to get all versions
+		_, resourceLists, err = dc.ServerGroupsAndResources()
+		if err != nil {
+			if !discovery.IsGroupDiscoveryFailedError(err) {
+				return ctrl.Result{}, err
+			}
+			logger.Info("Discovery failed for some groups, proceeding with partial results", "error", err)
+		}
+	}
+
+	for _, rule := range krmsyncer.Spec.Rules {
+		gvks, err := r.expandRule(ctx, krmsyncer, rule, mode, resourceLists)
 		if err != nil {
 			logger.Error(err, "Failed to expand rule", "rule", rule)
 			meta.SetStatusCondition(&krmsyncer.Status.Conditions, metav1.Condition{
@@ -206,7 +243,7 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 				Reason:  "InvalidGlob",
 				Message: err.Error(),
 			})
-			continue
+			return ctrl.Result{}, err
 		}
 
 		for _, gvk := range gvks {
@@ -356,8 +393,15 @@ type DynamicResourceReconciler struct {
 }
 
 func (r *DynamicResourceReconciler) ruleMatchesGVK(rule krmv1alpha1.ResourceRule, gvk schema.GroupVersionKind) bool {
-	if rule.Group == "*.cnrm.cloud.google.com" && rule.Version == "*" && rule.Kind == "*" {
-		return strings.HasSuffix(gvk.Group, ".cnrm.cloud.google.com")
+	isKCCGlob := (rule.Group == "*.cnrm.cloud.google.com" ||
+		strings.HasSuffix(rule.Group, ".cnrm.cloud.google.com") ||
+		rule.Group == "cnrm.cloud.google.com") && rule.Version == "*" && rule.Kind == "*"
+
+	if isKCCGlob {
+		if rule.Group == "*.cnrm.cloud.google.com" {
+			return strings.HasSuffix(gvk.Group, "cnrm.cloud.google.com")
+		}
+		return gvk.Group == rule.Group
 	}
 	return rule.Group == gvk.Group && rule.Version == gvk.Version && rule.Kind == gvk.Kind
 }
