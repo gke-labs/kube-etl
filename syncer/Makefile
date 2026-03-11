@@ -1,3 +1,7 @@
+# Image URL to use all building/pushing image targets
+PROJECT_ID ?= $(shell gcloud config get-value project)
+IMG ?= gcr.io/${PROJECT_ID}/krmsyncer/controller:latest
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -37,6 +41,31 @@ manifests:
 # Generate code (deepcopy, etc.)
 generate:
 	controller-gen object paths="./..."
+
+# Build the docker image
+docker-build: test
+	docker build . -t ${IMG}
+
+# Push the docker image
+docker-push:
+	docker push ${IMG}
+
+# Install CRDs into a cluster
+install: manifests
+	kustomize build config/crd | kubectl apply -f -
+
+# Uninstall CRDs from a cluster
+uninstall: manifests
+	kustomize build config/crd | kubectl delete -f -
+
+# Deploy controller in the configured Kubernetes cluster in ~/.kube/config
+deploy: manifests
+	cd config/manager && kustomize edit set image controller=${IMG}
+	kustomize build config/default | kubectl apply -f -
+
+## Undeploy controller from the K8s cluster specified in ~/.kube/config.
+undeploy:
+	kustomize build config/default | kubectl delete --ignore-not-found=true -f -
 
 ##@ Integration Testing
 
