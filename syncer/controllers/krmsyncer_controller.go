@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -100,6 +101,90 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return r.reconcile(ctx, &krmSyncer)
 }
 
+func (r *KRMSyncerReconciler) validateRule(rule krmv1alpha1.ResourceRule) error {
+	hasGlob := strings.Contains(rule.Group, "*") || strings.Contains(rule.Version, "*") || strings.Contains(rule.Kind, "*")
+	if hasGlob {
+		if rule.Group != "*.cnrm.cloud.google.com" || rule.Version != "*" || rule.Kind != "*" {
+			return fmt.Errorf("globbing ('*') is only allowed for version and kind if group is exactly '*.cnrm.cloud.google.com'")
+		}
+	}
+	return nil
+}
+
+func (r *KRMSyncerReconciler) getDiscoveryClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, mode krmv1alpha1.Mode) (discovery.DiscoveryInterface, error) {
+	if mode == krmv1alpha1.ModePush {
+		return discovery.NewDiscoveryClientForConfig(r.Manager.GetConfig())
+	}
+
+	// Pull mode
+	secret := &corev1.Secret{}
+	secretKey := client.ObjectKey{
+		Name:      krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name,
+		Namespace: krmsyncer.Namespace,
+	}
+	if err := r.Get(ctx, secretKey, secret); err != nil {
+		return nil, err
+	}
+
+	kubeconfig, ok := secret.Data["kubeconfig"]
+	if !ok {
+		return nil, fmt.Errorf("secret %s does not contain 'kubeconfig' key", secretKey.Name)
+	}
+
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return discovery.NewDiscoveryClientForConfig(restConfig)
+}
+
+func (r *KRMSyncerReconciler) expandRule(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, rule krmv1alpha1.ResourceRule, mode krmv1alpha1.Mode) ([]schema.GroupVersionKind, error) {
+	if err := r.validateRule(rule); err != nil {
+		return nil, err
+	}
+
+	if rule.Group == "*.cnrm.cloud.google.com" && rule.Version == "*" && rule.Kind == "*" {
+		dc, err := r.getDiscoveryClient(ctx, krmsyncer, mode)
+		if err != nil {
+			return nil, err
+		}
+		resourceLists, err := dc.ServerPreferredResources()
+		if err != nil {
+			return nil, err
+		}
+
+		var gvks []schema.GroupVersionKind
+		for _, rl := range resourceLists {
+			gv, err := schema.ParseGroupVersion(rl.GroupVersion)
+			if err != nil {
+				continue
+			}
+			if !strings.HasSuffix(gv.Group, ".cnrm.cloud.google.com") {
+				continue
+			}
+			for _, res := range rl.APIResources {
+				// Avoid subresources
+				if strings.Contains(res.Name, "/") {
+					continue
+				}
+				gvks = append(gvks, schema.GroupVersionKind{
+					Group:   gv.Group,
+					Version: gv.Version,
+					Kind:    res.Kind,
+				})
+			}
+		}
+		return gvks, nil
+	}
+
+	return []schema.GroupVersionKind{{
+		Group:   rule.Group,
+		Version: rule.Version,
+		Kind:    rule.Kind,
+	}}, nil
+}
+
 func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -112,37 +197,45 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 	}
 
 	for _, rule := range krmsyncer.Spec.Rules {
-		gvk := schema.GroupVersionKind{
-			Group:   rule.Group,
-			Version: rule.Version,
-			Kind:    rule.Kind,
+		gvks, err := r.expandRule(ctx, krmsyncer, rule, mode)
+		if err != nil {
+			logger.Error(err, "Failed to expand rule", "rule", rule)
+			meta.SetStatusCondition(&krmsyncer.Status.Conditions, metav1.Condition{
+				Type:    "InvalidRule",
+				Status:  metav1.ConditionTrue,
+				Reason:  "InvalidGlob",
+				Message: err.Error(),
+			})
+			continue
 		}
 
-		if mode == krmv1alpha1.ModePull {
-			if krmsyncer.Spec.Remote == nil || krmsyncer.Spec.Remote.ClusterConfig == nil || krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef == nil {
-				logger.Error(fmt.Errorf("remote cluster config missing"), "Cannot start remote watcher")
-				continue
-			}
-			rgvk := RemoteGVK{
-				RemoteNamespace: krmsyncer.Namespace,
-				RemoteSecret:    krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name,
-				GVK:             gvk,
-			}
-			if !r.WatchedRemoteGVKs[rgvk] {
-				if err := r.startRemoteWatcher(ctx, krmsyncer, gvk); err != nil {
-					logger.Error(err, "Failed to start remote watcher for GVK", "gvk", gvk)
+		for _, gvk := range gvks {
+			if mode == krmv1alpha1.ModePull {
+				if krmsyncer.Spec.Remote == nil || krmsyncer.Spec.Remote.ClusterConfig == nil || krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef == nil {
+					logger.Error(fmt.Errorf("remote cluster config missing"), "Cannot start remote watcher")
 					continue
 				}
-				r.WatchedRemoteGVKs[rgvk] = true
-			}
-		} else {
-			// Push mode
-			if !r.WatchedGVKs[gvk] {
-				if err := r.startWatcher(ctx, gvk); err != nil {
-					logger.Error(err, "Failed to start watcher for GVK", "gvk", gvk)
-					continue
+				rgvk := RemoteGVK{
+					RemoteNamespace: krmsyncer.Namespace,
+					RemoteSecret:    krmsyncer.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name,
+					GVK:             gvk,
 				}
-				r.WatchedGVKs[gvk] = true
+				if !r.WatchedRemoteGVKs[rgvk] {
+					if err := r.startRemoteWatcher(ctx, krmsyncer, gvk); err != nil {
+						logger.Error(err, "Failed to start remote watcher for GVK", "gvk", gvk)
+						continue
+					}
+					r.WatchedRemoteGVKs[rgvk] = true
+				}
+			} else {
+				// Push mode
+				if !r.WatchedGVKs[gvk] {
+					if err := r.startWatcher(ctx, gvk); err != nil {
+						logger.Error(err, "Failed to start watcher for GVK", "gvk", gvk)
+						continue
+					}
+					r.WatchedGVKs[gvk] = true
+				}
 			}
 		}
 	}
@@ -262,6 +355,13 @@ type DynamicResourceReconciler struct {
 	Remote       RemoteGVK // Only used for Pull mode
 }
 
+func (r *DynamicResourceReconciler) ruleMatchesGVK(rule krmv1alpha1.ResourceRule, gvk schema.GroupVersionKind) bool {
+	if rule.Group == "*.cnrm.cloud.google.com" && rule.Version == "*" && rule.Kind == "*" {
+		return strings.HasSuffix(gvk.Group, ".cnrm.cloud.google.com")
+	}
+	return rule.Group == gvk.Group && rule.Version == gvk.Version && rule.Kind == gvk.Kind
+}
+
 func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -311,7 +411,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		for _, rule := range krmsyncer.Spec.Rules {
 			// Check GVK match
-			if rule.Group != r.GVK.Group || rule.Version != r.GVK.Version || rule.Kind != r.GVK.Kind {
+			if !r.ruleMatchesGVK(rule, r.GVK) {
 				continue
 			}
 

@@ -165,7 +165,11 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 	}
 
 	// Create Resource in Source
-	createBytes, err := ioutil.ReadFile("../integration/testdata/object.yaml") // Default create
+	objectPath := filepath.Join(caseDir, "object.yaml")
+	if _, err := os.Stat(objectPath); os.IsNotExist(err) {
+		objectPath = "../integration/testdata/object.yaml"
+	}
+	createBytes, err := ioutil.ReadFile(objectPath)
 	require.NoError(t, err)
 	resource := &unstructured.Unstructured{}
 	require.NoError(t, yaml.Unmarshal(createBytes, resource))

@@ -1,0 +1,9 @@
+apiVersion: fake.cnrm.cloud.google.com/v1beta1
+kind: FakeObject
+metadata:
+  name: glob-test
+  namespace: default
+spec:
+  foo: "should-not-sync"
+status:
+  bar: "should-sync"
