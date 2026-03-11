@@ -21,7 +21,6 @@ import (
 	"github.com/gke-labs/kube-etl/syncer/controllers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"io/ioutil"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -125,7 +124,7 @@ func TestKRMSyncerIntegration(t *testing.T) {
 
 	// 4. Run Test Cases
 	casesDir := "../integration/cases"
-	dirs, err := ioutil.ReadDir(casesDir)
+	dirs, err := os.ReadDir(casesDir)
 	require.NoError(t, err)
 
 	for _, d := range dirs {
@@ -143,7 +142,7 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 	t.Logf("Running test case: %s", filepath.Base(caseDir))
 
 	// Load Syncer
-	syncerBytes, err := ioutil.ReadFile(filepath.Join(caseDir, "syncer.yaml"))
+	syncerBytes, err := os.ReadFile(filepath.Join(caseDir, "syncer.yaml"))
 	require.NoError(t, err)
 	syncer := &krmv1alpha1.KRMSyncer{}
 	require.NoError(t, yaml.Unmarshal(syncerBytes, syncer))
@@ -165,7 +164,11 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 	}
 
 	// Create Resource in Source
-	createBytes, err := ioutil.ReadFile("../integration/testdata/object.yaml") // Default create
+	objectPath := filepath.Join(caseDir, "object.yaml")
+	if _, err := os.Stat(objectPath); os.IsNotExist(err) {
+		objectPath = "../integration/testdata/object.yaml"
+	}
+	createBytes, err := os.ReadFile(objectPath)
 	require.NoError(t, err)
 	resource := &unstructured.Unstructured{}
 	require.NoError(t, yaml.Unmarshal(createBytes, resource))
@@ -195,7 +198,7 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 	time.Sleep(1 * time.Second)
 
 	// Verify Output
-	expectedBytes, err := ioutil.ReadFile(filepath.Join(caseDir, "expected.yaml"))
+	expectedBytes, err := os.ReadFile(filepath.Join(caseDir, "expected.yaml"))
 	// If expected.yaml is empty or missing (and we assume empty implies Not Found for suspend case)
 	if err == nil && len(expectedBytes) > 0 {
 		expected := &unstructured.Unstructured{}

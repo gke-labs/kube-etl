@@ -1,0 +1,7 @@
+apiVersion: kcc.cnrm.cloud.google.com/v1alpha1
+kind: KCCResource
+metadata:
+  name: test-pull-glob
+  namespace: default
+spec:
+  foo: bar
