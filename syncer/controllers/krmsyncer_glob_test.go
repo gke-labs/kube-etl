@@ -15,10 +15,10 @@
 package controllers
 
 import (
-	"testing"
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"testing"
 )
 
 func TestValidateRule(t *testing.T) {
