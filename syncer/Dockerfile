@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Build the manager binary
-FROM golang:1.24 as builder
+FROM golang:1.25 AS builder
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -31,11 +31,24 @@ COPY controllers/ controllers/
 # Build
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o manager main.go
 
-# Use distroless as minimal base image to package the manager binary
-# Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot
+# Use Google Cloud SDK slim image as the base image to include gcloud
+# and install the gke-gcloud-auth-plugin for authentication
+FROM gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+
 WORKDIR /
+
+# Install the gke-gcloud-auth-plugin
+RUN apt-get update && apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Add a non-root user to run the controller securely and ensure gcloud has a writable config dir
+RUN useradd -u 65532 -m nonroot && \
+    mkdir -p /home/nonroot/.config/gcloud && \
+    chown -R 65532:65532 /home/nonroot/.config
+
 COPY --from=builder /workspace/manager .
+
+# Run as nonroot
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]
