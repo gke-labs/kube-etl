@@ -17,10 +17,12 @@ package integration
 import (
 	"bytes"
 	"context"
+	"fmt"
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/gke-labs/kube-etl/syncer/controllers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"io"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -163,70 +165,106 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 		destClient = clientA
 	}
 
-	// Create Resource in Source
-	objectPath := filepath.Join(caseDir, "object.yaml")
-	if _, err := os.Stat(objectPath); os.IsNotExist(err) {
-		objectPath = "../integration/testdata/object.yaml"
-	}
+	// Read all Resources from object.yaml
+	objectPath := "../integration/testdata/object.yaml"
 	createBytes, err := os.ReadFile(objectPath)
 	require.NoError(t, err)
-	resource := &unstructured.Unstructured{}
-	require.NoError(t, yaml.Unmarshal(createBytes, resource))
 
-	// Capture status from YAML
-	initialStatus, hasStatus, err := unstructured.NestedFieldCopy(resource.Object, "status")
-	require.NoError(t, err)
-
-	// Clean up Resource at end of test
-	defer func() {
-		_ = clientA.Delete(ctx, resource)
-		_ = clientB.Delete(ctx, resource) // Cleanup on both just in case
-	}()
-
-	t.Logf("Creating Resource in Source Cluster (Mode: %s)...", syncer.Spec.Mode)
-	require.NoError(t, sourceClient.Create(ctx, resource))
-
-	// Update Status in Source
-	if hasStatus {
-		statusObj := resource.DeepCopy()
-		err := unstructured.SetNestedField(statusObj.Object, initialStatus, "status")
-		require.NoError(t, err)
-		require.NoError(t, sourceClient.Status().Update(ctx, statusObj))
+	resources := []*unstructured.Unstructured{}
+	decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(createBytes), 4096)
+	for {
+		res := &unstructured.Unstructured{}
+		if err := decoder.Decode(res); err != nil {
+			if err == io.EOF {
+				break
+			}
+			require.NoError(t, err)
+		}
+		if res.Object == nil {
+			continue
+		}
+		resources = append(resources, res)
 	}
 
-	// Sleep to allow resource to sync
-	time.Sleep(1 * time.Second)
+	// Clean up Resources at end of test
+	defer func() {
+		for _, r := range resources {
+			_ = clientA.Delete(ctx, r)
+			_ = clientB.Delete(ctx, r) // Cleanup on both just in case
+		}
+	}()
 
-	// Verify Output
-	expectedBytes, err := os.ReadFile(filepath.Join(caseDir, "expected.yaml"))
-	// If expected.yaml is empty or missing (and we assume empty implies Not Found for suspend case)
-	if err == nil && len(expectedBytes) > 0 {
-		expected := &unstructured.Unstructured{}
-		require.NoError(t, yaml.Unmarshal(expectedBytes, expected))
-
-		t.Log("Verifying expected resource in Destination Cluster...")
-		actual := &unstructured.Unstructured{}
-		actual.SetGroupVersionKind(resource.GroupVersionKind())
-		err := destClient.Get(ctx, client.ObjectKeyFromObject(resource), actual)
+	// Apply All Resources in Source
+	for _, resource := range resources {
+		t.Logf("Creating Resource %s/%s in Source Cluster...", resource.GetKind(), resource.GetName())
+		// Capture initial status
+		initialStatus, hasStatus, err := unstructured.NestedFieldCopy(resource.Object, "status")
 		require.NoError(t, err)
 
-		// Compare Spec
-		expectedSpec, _, _ := unstructured.NestedMap(expected.Object, "spec")
-		actualSpec, _, _ := unstructured.NestedMap(actual.Object, "spec")
-		assert.Equal(t, expectedSpec, actualSpec, "Spec mismatch")
+		// Create in Source
+		resCopy := resource.DeepCopy()
+		require.NoError(t, sourceClient.Create(ctx, resCopy))
 
-		// Compare Status
-		expectedStatus, _, _ := unstructured.NestedMap(expected.Object, "status")
-		actualStatus, _, _ := unstructured.NestedMap(actual.Object, "status")
-		assert.Equal(t, expectedStatus, actualStatus, "Status mismatch")
+		// Update Status in Source
+		if hasStatus {
+			statusObj := resCopy.DeepCopy()
+			err := unstructured.SetNestedField(statusObj.Object, initialStatus, "status")
+			require.NoError(t, err)
+			require.NoError(t, sourceClient.Status().Update(ctx, statusObj))
+		}
+	}
 
-	} else {
-		// Expect Not Found (Suspend case)
-		t.Log("Verifying resource does NOT exist in Destination Cluster...")
+	// Sleep to allow resources to sync
+	time.Sleep(2 * time.Second)
+
+	// Verify Output
+	expectedPath := filepath.Join(caseDir, "expected.yaml")
+	expectedBytes, err := os.ReadFile(expectedPath)
+	expectedResources := make(map[string]*unstructured.Unstructured)
+	if err == nil && len(expectedBytes) > 0 {
+		expDecoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(expectedBytes), 4096)
+		for {
+			exp := &unstructured.Unstructured{}
+			if err := expDecoder.Decode(exp); err != nil {
+				if err == io.EOF {
+					break
+				}
+				require.NoError(t, err)
+			}
+			if exp.Object == nil {
+				continue
+			}
+			// Use Kind/Name as key to be safe, although names are unique here
+			key := fmt.Sprintf("%s/%s", exp.GetKind(), exp.GetName())
+			expectedResources[key] = exp
+		}
+	}
+
+	for _, resource := range resources {
+		key := fmt.Sprintf("%s/%s", resource.GetKind(), resource.GetName())
+		expected, shouldExist := expectedResources[key]
+
 		actual := &unstructured.Unstructured{}
 		actual.SetGroupVersionKind(resource.GroupVersionKind())
 		err := destClient.Get(ctx, client.ObjectKeyFromObject(resource), actual)
-		assert.True(t, errors.IsNotFound(err), "Resource should not exist in Destination Cluster")
+
+		if shouldExist {
+			t.Logf("Verifying expected resource %s in Destination Cluster...", key)
+			require.NoError(t, err, "Resource %s should exist in Destination Cluster", key)
+
+			// Compare Spec
+			expectedSpec, _, _ := unstructured.NestedMap(expected.Object, "spec")
+			actualSpec, _, _ := unstructured.NestedMap(actual.Object, "spec")
+			assert.Equal(t, expectedSpec, actualSpec, "Spec mismatch for %s", key)
+
+			// Compare Status
+			expectedStatus, _, _ := unstructured.NestedMap(expected.Object, "status")
+			actualStatus, _, _ := unstructured.NestedMap(actual.Object, "status")
+			assert.Equal(t, expectedStatus, actualStatus, "Status mismatch for %s", key)
+		} else {
+			t.Logf("Verifying resource %s does NOT exist in Destination Cluster...", key)
+			assert.True(t, errors.IsNotFound(err), "Resource %s should NOT exist in Destination Cluster", key)
+		}
 	}
 }
 
