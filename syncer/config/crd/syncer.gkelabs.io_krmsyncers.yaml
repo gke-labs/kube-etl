@@ -180,6 +180,44 @@ spec:
                   - type
                   type: object
                 type: array
+              observedGeneration:
+                description: ObservedGeneration is the most recent generation observed
+                  by the controller.
+                format: int64
+                type: integer
+              resourceStatuses:
+                description: ResourceStatuses tracks the status of each resource type
+                  being synced.
+                items:
+                  description: ResourceStatus tracks the status of a specific resource
+                    type.
+                  properties:
+                    group:
+                      type: string
+                    kind:
+                      type: string
+                    lastSyncDuration:
+                      description: LastSyncDuration is the duration of the last successful
+                        sync.
+                      type: string
+                    lastSyncTime:
+                      description: LastSyncTime is the last time a resource of this
+                        type was successfully synced.
+                      format: date-time
+                      type: string
+                    syncCount:
+                      description: SyncCount is the total number of successful syncs
+                        for this resource type.
+                      format: int64
+                      type: integer
+                    version:
+                      type: string
+                  required:
+                  - group
+                  - kind
+                  - version
+                  type: object
+                type: array
             type: object
         type: object
     served: true

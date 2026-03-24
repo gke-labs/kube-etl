@@ -31,11 +31,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
@@ -75,6 +77,7 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Update Status if needed
 	defer func() {
+		krmSyncer.Status.ObservedGeneration = krmSyncer.Generation
 		if err := r.Status().Update(ctx, &krmSyncer); err != nil {
 			logger.Error(err, "Failed to update KRMSyncer status")
 		}
@@ -380,6 +383,7 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.RemoteClusters = make(map[string]cluster.Cluster)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
+		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Complete(r)
 }
 
@@ -408,6 +412,11 @@ func (r *DynamicResourceReconciler) ruleMatchesGVK(rule krmv1alpha1.ResourceRule
 
 func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// Skip kubernetes service in default namespace as it triggers too many events
+	if r.GVK.Kind == "Service" && req.Name == "kubernetes" && req.Namespace == "default" {
+		return ctrl.Result{}, nil
+	}
 
 	// Fetch the resource from Source cluster
 	u := &unstructured.Unstructured{}
@@ -520,11 +529,16 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			destObj.SetGeneration(0)
 			destObj.SetManagedFields(nil)
 
+			startTime := time.Now()
 			if err := r.applyToDestination(ctx, destClient, destObj); err != nil {
 				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to apply to destination cluster")
 			} else {
-				logger.Info("Successfully synced resource to destination cluster", "name", u.GetName(), "namespace", u.GetNamespace())
+				duration := time.Since(startTime)
+				logger.Info("Successfully synced resource to destination cluster", "name", u.GetName(), "namespace", u.GetNamespace(), "duration", duration)
+				if err := r.updateSyncStatus(ctx, &krmsyncer, duration); err != nil {
+					logger.Error(err, "Failed to update sync status after sync")
+				}
 			}
 		}
 	}
@@ -619,6 +633,60 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 		if err := destClient.Status().Patch(ctx, statusObj, client.Apply, subResourcePatchOpts...); err != nil {
 			return fmt.Errorf("failed to apply status subresource to destination: %v", err)
 		}
+	}
+	return nil
+}
+
+func (r *DynamicResourceReconciler) updateSyncStatus(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, duration time.Duration) error {
+	logger := log.FromContext(ctx)
+
+	key := client.ObjectKeyFromObject(krmsyncer)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &krmv1alpha1.KRMSyncer{}
+		if err := r.LocalClient.Get(ctx, key, latest); err != nil {
+			return err
+		}
+
+		now := metav1.Now()
+		metav1Duration := &metav1.Duration{Duration: duration}
+		shouldUpdate := false
+		found := false
+
+		for i, rs := range latest.Status.ResourceStatuses {
+			if rs.Group == r.GVK.Group && rs.Version == r.GVK.Version && rs.Kind == r.GVK.Kind {
+				found = true
+				// Rate limit status updates to once every 2 seconds to avoid overwhelming API server
+				if rs.LastSyncTime == nil || now.Sub(rs.LastSyncTime.Time) > 2*time.Second {
+					latest.Status.ResourceStatuses[i].LastSyncTime = &now
+					latest.Status.ResourceStatuses[i].LastSyncDuration = metav1Duration
+					latest.Status.ResourceStatuses[i].SyncCount++
+					shouldUpdate = true
+				}
+				break
+			}
+		}
+		if !found {
+			latest.Status.ResourceStatuses = append(latest.Status.ResourceStatuses, krmv1alpha1.ResourceStatus{
+				Group:            r.GVK.Group,
+				Version:          r.GVK.Version,
+				Kind:             r.GVK.Kind,
+				LastSyncTime:     &now,
+				LastSyncDuration: metav1Duration,
+				SyncCount:        1,
+			})
+			shouldUpdate = true
+		}
+
+		if shouldUpdate {
+			latest.Status.ObservedGeneration = latest.Generation
+			return r.LocalClient.Status().Update(ctx, latest)
+		}
+		return nil
+	})
+
+	if err != nil {
+		logger.Error(err, "Failed to update KRMSyncer status in DynamicResourceReconciler after retries")
+		return err
 	}
 	return nil
 }

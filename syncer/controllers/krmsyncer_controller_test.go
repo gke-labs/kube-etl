@@ -235,6 +235,31 @@ func TestSyncerSync(t *testing.T) {
 		return client.IgnoreNotFound(err) == nil && err != nil, nil
 	})
 	assert.NoError(t, err, "Service should be deleted from dest")
+
+	// Verify Syncer Status with polling
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		latestSyncer := &krmv1alpha1.KRMSyncer{}
+		err = k8sClientSource.Get(ctx, types.NamespacedName{Name: syncerName, Namespace: ns}, latestSyncer)
+		if err != nil {
+			return false, err
+		}
+
+		if latestSyncer.Status.ObservedGeneration < 1 {
+			return false, nil
+		}
+
+		foundService := false
+		for _, rs := range latestSyncer.Status.ResourceStatuses {
+			if rs.Kind == "Service" {
+				foundService = true
+				if rs.SyncCount < 1 || rs.LastSyncTime == nil || rs.LastSyncDuration == nil {
+					return false, nil
+				}
+			}
+		}
+		return foundService, nil
+	})
+	assert.NoError(t, err, "Syncer status should be updated with resource stats and observed generation")
 }
 
 func TestSyncerSyncFields(t *testing.T) {
