@@ -89,6 +89,30 @@ type KRMSyncerStatus struct {
 	// Conditions of the Syncer.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// ObservedGeneration is the most recent generation observed by the controller.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// ResourceStatuses tracks the status of each resource type being synced.
+	// +optional
+	ResourceStatuses []ResourceStatus `json:"resourceStatuses,omitempty"`
+}
+
+// ResourceStatus tracks the status of a specific resource type.
+type ResourceStatus struct {
+	Group   string `json:"group"`
+	Version string `json:"version"`
+	Kind    string `json:"kind"`
+	// LastSyncTime is the last time a resource of this type was successfully synced.
+	// +optional
+	LastSyncTime *metav1.Time `json:"lastSyncTime,omitempty"`
+	// LastSyncDuration is the duration of the last successful sync.
+	// +optional
+	LastSyncDuration *metav1.Duration `json:"lastSyncDuration,omitempty"`
+	// SyncCount is the total number of successful syncs for this resource type.
+	// +optional
+	SyncCount int64 `json:"syncCount,omitempty"`
 }
 
 // +kubebuilder:object:root=true
