@@ -80,6 +80,7 @@ type KRMSyncerSpec struct {
 	Remote *RemoteConfig `json:"remote"`
 
 	// Rules defines which resources to watch and sync. If unset, sync all resources by default.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="Rules are immutable"
 	Rules []ResourceRule `json:"rules"`
 }
 
