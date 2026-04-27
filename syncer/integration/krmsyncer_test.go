@@ -25,6 +25,7 @@ import (
 	"io"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -288,4 +289,74 @@ func createKubeconfig(cfg *rest.Config) ([]byte, error) {
 	}
 	config.CurrentContext = "default"
 	return clientcmd.Write(*config)
+}
+
+func TestKRMSyncerImmutability(t *testing.T) {
+	testScheme := scheme.Scheme
+	require.NoError(t, krmv1alpha1.AddToScheme(testScheme))
+
+	cfg := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd")},
+		ErrorIfCRDPathMissing: true,
+	}
+	config, err := cfg.Start()
+	require.NoError(t, err)
+	defer cfg.Stop()
+
+	k8sClient, err := client.New(config, client.Options{Scheme: testScheme})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-immutability",
+			Namespace: "default",
+		},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group:   "apps",
+					Version: "v1",
+					Kind:    "Deployment",
+				},
+			},
+			Remote: &krmv1alpha1.RemoteConfig{
+				ClusterConfig: &krmv1alpha1.ClusterConfig{
+					KubeConfigSecretRef: &corev1.SecretReference{
+						Name: "some-secret",
+					},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, syncer))
+
+	// 1. Try to update Rules
+	syncerCopy := syncer.DeepCopy()
+	syncerCopy.Spec.Rules = append(syncerCopy.Spec.Rules, krmv1alpha1.ResourceRule{
+		Group:   "",
+		Version: "v1",
+		Kind:    "ConfigMap",
+	})
+	err = k8sClient.Update(ctx, syncerCopy)
+	require.Error(t, err, "Expected error when updating immutable field Rules")
+	assert.Contains(t, err.Error(), "Rules is immutable")
+
+	// 2. Try to update Mode
+	syncerCopy = syncer.DeepCopy()
+	syncerCopy.Spec.Mode = krmv1alpha1.ModePush
+	err = k8sClient.Update(ctx, syncerCopy)
+	require.Error(t, err, "Expected error when updating immutable field Mode")
+	assert.Contains(t, err.Error(), "Mode is immutable")
+
+	// 3. Try to update Remote
+	syncerCopy = syncer.DeepCopy()
+	syncerCopy.Spec.Remote.ClusterConfig.KubeConfigSecretRef.Name = "other-secret"
+	err = k8sClient.Update(ctx, syncerCopy)
+	require.Error(t, err, "Expected error when updating immutable field Remote")
+	assert.Contains(t, err.Error(), "Remote is immutable")
+
+	t.Log("Got all expected errors for immutable fields")
 }
