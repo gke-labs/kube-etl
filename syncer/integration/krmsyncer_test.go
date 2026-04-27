@@ -306,7 +306,7 @@ func TestKRMSyncerImmutability(t *testing.T) {
 	k8sClient, err := client.New(config, client.Options{Scheme: testScheme})
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{
