@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.20.0
+    controller-gen.kubebuilder.io/version: v0.20.1
   name: krmsyncers.syncer.gkelabs.io
 spec:
   group: syncer.gkelabs.io
@@ -46,6 +46,9 @@ spec:
                 - push
                 - pull
                 type: string
+                x-kubernetes-validations:
+                - message: Mode is immutable
+                  rule: self == oldSelf
               remote:
                 description: Remote defines the remote cluster for the sync.
                 properties:
@@ -72,6 +75,9 @@ spec:
                     - kubeConfigSecretRef
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: Remote is immutable
+                  rule: self == oldSelf
               rules:
                 description: Rules defines which resources to watch and sync. If unset,
                   sync all resources by default.
@@ -113,6 +119,9 @@ spec:
                   - version
                   type: object
                 type: array
+                x-kubernetes-validations:
+                - message: Rules is immutable
+                  rule: self == oldSelf
               suspend:
                 description: Suspend tells the controller to suspend the sync operations.
                 type: boolean
