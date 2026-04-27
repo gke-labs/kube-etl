@@ -74,12 +74,15 @@ type KRMSyncerSpec struct {
 	// +optional
 	// +kubebuilder:validation:Enum=push;pull
 	// +kubebuilder:default=pull
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="Mode is immutable"
 	Mode Mode `json:"mode,omitempty"`
 
 	// Remote defines the remote cluster for the sync.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="Remote is immutable"
 	Remote *RemoteConfig `json:"remote"`
 
 	// Rules defines which resources to watch and sync. If unset, sync all resources by default.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="Rules is immutable"
 	Rules []ResourceRule `json:"rules"`
 }
 
