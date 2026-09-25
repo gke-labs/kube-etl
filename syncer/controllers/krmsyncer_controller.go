@@ -584,6 +584,26 @@ func (r *DynamicResourceReconciler) filterFields(src *unstructured.Unstructured,
 }
 
 func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, destClient client.Client, obj *unstructured.Unstructured) error {
+	// Ensure destination namespace exists before applying the resource.
+	nsName := obj.GetNamespace()
+	if nsName != "" {
+		ns := &corev1.Namespace{}
+		err := destClient.Get(ctx, client.ObjectKey{Name: nsName}, ns)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				ns = &corev1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: nsName,
+					},
+				}
+				if err := destClient.Create(ctx, ns); err != nil {
+					return fmt.Errorf("failed to create destination namespace %q: %v", nsName, err)
+				}
+			} else {
+				return fmt.Errorf("failed to check destination namespace %q: %v", nsName, err)
+			}
+		}
+	}
 	patchOpts := []client.PatchOption{
 		client.ForceOwnership,
 		client.FieldOwner("krm-syncer"),

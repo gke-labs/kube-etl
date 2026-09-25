@@ -33,6 +33,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -652,4 +653,91 @@ func createKubeconfig(cfg *rest.Config) ([]byte, error) {
 	}
 
 	return clientcmd.Write(config)
+}
+
+func TestSyncerSyncMissingNamespace(t *testing.T) {
+	ctx := t.Context()
+	ns := "missing-dest-ns"
+	secretName := "dest-kubeconfig-missing-ns"
+	syncerName := "test-syncer-missing-ns"
+	targetServiceName := "target-service-missing-ns"
+
+	// 1. Create the source namespace first so we have a place to create our source objects
+	srcNamespace := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: ns},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() {
+		_ = k8sClientSource.Delete(ctx, srcNamespace)
+	}()
+
+	// 2. Verify that the namespace does NOT exist in the destination cluster
+	destNamespace := &corev1.Namespace{}
+	err := k8sClientDest.Get(ctx, types.NamespacedName{Name: ns}, destNamespace)
+	require.Error(t, err)
+	require.True(t, errors.IsNotFound(err))
+
+	// 3. Generate kubeconfig from envtest Dest config
+	destKubeconfigContent, err := createKubeconfig(cfgDest)
+	require.NoError(t, err)
+
+	// Create Secret in Source with Dest Kubeconfig
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
+		Data:       map[string][]byte{"kubeconfig": destKubeconfigContent},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, secret))
+
+	// Create Syncer
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Suspend: false,
+			Mode:    krmv1alpha1.ModePush,
+			Remote: &krmv1alpha1.RemoteConfig{
+				ClusterConfig: &krmv1alpha1.ClusterConfig{
+					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
+				},
+			},
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"spec"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+
+	// Create target Service in Source
+	target := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, target))
+
+	// 4. Verify that the namespace gets created in destination cluster AND the Service is successfully synced
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		destSvc := &corev1.Service{}
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+		if err != nil {
+			return false, nil
+		}
+		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 80, nil
+	})
+	assert.NoError(t, err, "Namespace and Service should be auto-created and synced to dest")
+
+	// Verify namespace actually exists in destination cluster
+	err = k8sClientDest.Get(ctx, types.NamespacedName{Name: ns}, destNamespace)
+	assert.NoError(t, err, "Destination namespace should exist")
+
+	// Cleanup
+	require.NoError(t, k8sClientSource.Delete(ctx, target))
+	require.NoError(t, k8sClientSource.Delete(ctx, syncer))
+	require.NoError(t, k8sClientSource.Delete(ctx, secret))
+	// Cleanup destination namespace
+	_ = k8sClientDest.Delete(ctx, destNamespace)
 }
