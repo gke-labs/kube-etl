@@ -1,12 +1,12 @@
 # KRMSyncer
 
-The KRMSyncer is a Kubernetes-native tool designed for multi-cluster state synchronization. It facilitates **Active-Passive (Failover)** scenarios where one cluster acts as the leader (Syncer's `Source`) and another acts as a standby (Syncer's `Destination`).
+The KRMSyncer is a Kubernetes-native tool designed for multi-cluster KRM resources synchronization.
 
 ## Features
 
 - **Push & Pull Models:** Support both pushing from local to remote and pulling from remote to local clusters.
 - **Dynamic Watching:** Dynamically registers watches for resources specified in the configuration.
-- **Resource Syncing:** Syncs standard resources (e.g., ConfigMaps, Secrets) and CRDs.
+- **Resource Syncing:** Syncs standard resources (e.g., ConfigMaps, Secrets).
 - **Status Syncing:** Optionally syncs the status subresource.
 - **Suspension:** Supports pausing sync operations via a `suspend` field.
 - **Namespace Mapping:** Supports syncing to a specific destination namespace.
@@ -59,90 +59,60 @@ make test-integration
 
 ## Getting Started
 
-### 1. Prerequisites
-- **Remote Cluster Secret**: A Secret in the same namespace as the `KRMSyncer` resource containing the `kubeconfig` key with the target cluster's configuration.
-- **RBAC**: The operator needs permissions to read the resources defined in the rules and to manage `Syncer` resources.
+### 1. Deploy KRMSyncer to the Destination Cluster
 
-### 2. Build and Deploy
+Use the `krmsyncer sync` command. It's a Go CLI in [`cmd/krmsyncer`](cmd/krmsyncer).
 
 ```bash
 # Build the manager binary
 cd syncer
 make build
 
-# Build Docker image
-docker build -t syncer-operator:latest .
+go run ./cmd/krmsyncer sync \
+  --source-cluster <SOURCE_CLUSTER_NAME> \
+  --source-location <SOURCE_CLUSTER_LOCATION> \
+  --project <GCP_PROJECT_ID> \
+  [--dest-cluster <DEST_CLUSTER_NAME>] \
+  [--dest-location <DEST_CLUSTER_LOCATION>] \
+  [-n <NAMESPACE>]
 ```
 
-Alternatively, you can start the KRMSyncer controller locally.
-```bash
-go run main.go
-```
+Run the CLI from the `krmsyncer` directory. It builds the image from the `Dockerfile` there and renders manifests from `config/`, and it exits with an error if run anywhere else.
 
-### 3. Usage Example: Cross-Cluster Sync
+`-n` sets the namespace for the `KRMSyncer` CR and the `source-cluster` Secret (default: `krmsyncer-system`, the same namespace as the controller).
 
-1. **Extract the Remote Kubeconfig**:
-    1. Find the remote cluster context name:
-       ```bash
-       kubectl config get-contexts
-       ```
+This command:
+1. Configures Workload Identity. It creates the `krmsyncer@<project>.iam.gserviceaccount.com` GSA, grants it `roles/container.viewer`, and binds it to the `krmsyncer-system/krmsyncer-controller-manager` KSA. This runs first so the new IAM bindings have time to propagate during the image build.
+2. Builds and pushes a fresh `gcr.io/<project>/krmsyncer/controller:latest`, then deletes all older images in that repository (and the stale local copy).
+3. Creates the `source-cluster` kubeconfig Secret. The kubeconfig authenticates with `gke-gcloud-auth-plugin --use_application_default_credentials`, so it contains no user credentials.
+4. Deploys the CRD, RBAC, and controller into the `krmsyncer-system` namespace of the destination cluster.
+5. Applies a sample `KRMSyncer` CR.
 
-    2. Export the context to file:
-       ```bash
-       kubectl config view --context=<REMOTE_CONTEXT_NAME> --minify --flatten > remote-kubeconfig.yaml
-       * Replace <REMOTE_CONTEXT_NAME> with the name found above
-       * --minify: Only includes the information for that specific context.
-       * --flatten: Embeds the certificate data directly into the file so it doesn't rely on external file paths.
-       ```
+Prerequisites: `kubectl`, `gcloud`, and `docker`. The destination cluster must have Workload Identity enabled, and you need a kubeconfig context for the source cluster (`gcloud container clusters get-credentials`).
 
-    3. Verify the file:
-       ```bash
-       kubectl --kubeconfig=remote-kubeconfig.yaml get nodes
-       ```
-       If this command works, `remote-kubeconfig.yaml` is ready to be used.
+> [!NOTE]
+> New IAM bindings can take a few minutes to take effect. On the first run, or after you change the controller's KSA name or namespace, the controller logs may show errors like these for a short time:
+>
+> ```
+> Permission 'iam.serviceAccounts.getAccessToken' denied ...
+> getting credentials: exec: executable gke-gcloud-auth-plugin failed with exit code 1
+> ```
+>
+> The controller retries automatically and starts syncing once the bindings take effect. You don't need to do anything. If the errors keep appearing after about 10 minutes, check the `roles/iam.workloadIdentityUser` binding on the GSA and the `iam.gke.io/gcp-service-account` annotation on the KSA.
 
-1. **Create the Kubeconfig Secret** (on the Local cluster):
-    ```bash
-    kubectl create secret generic remote-kubeconfig \
-      --from-file=kubeconfig=remote-kubeconfig.yaml
-    ```
+### 2. Usage Example: Cross-Cluster Sync
 
-1. **Apply the Syncer Resource** (on the Local cluster):
-    ```yaml
-    # test-syncer.yaml
-    apiVersion: syncer.gkelabs.io/v1alpha1
-    kind: KRMSyncer
-    metadata:
-      name: configmap-sync
-    spec:
-      suspend: false
-      mode: push
-      rules:
-        - group: ""
-          version: "v1"
-          kind: "ConfigMap"
-          namespaces: ["default"] # Only sync ConfigMaps in the 'default' namespace
-      remote:
-        clusterConfig:
-          kubeConfigSecretRef:
-            name: "remote-kubeconfig"
+1. Create a test resource in the Source cluster:
+   ```bash
+   kubectl --context=<source-cluster-context> create configmap test-sync-data --from-literal=key=value1
+   ```
 
-    ```
-    ```bash
-    kubectl apply -f test-syncer.yaml
-    ```
-1. **Verify the Results**:
-    1. Create a test resource in the Local cluster:
-       ```bash
-       kubectl create configmap test-sync-data --from-literal=key=value1
-       ```
-
-    1. Check the Remote cluster:
-       Switch your kubectl context to the Remote cluster and verify the ConfigMap has appeared:
-       ```bash
-       kubectl --context=<remote-cluster-context> get configmap test-sync-data
-       ```
-    1.  Expected Result:
-    - The `test-sync-data` ConfigMap created in the Source cluster should automatically appear in the Passive cluster within seconds.
-    - If you update the ConfigMap in the Active cluster, the changes should reflect in the Passive cluster.
-    - If you delete it from the Active cluster, it should be removed from the Passive cluster.
+1. Verify the test resource has been synced to the Destination cluster:
+   ```bash
+   kubectl get configmap test-sync-data
+   ```
+   
+1.  Expected Result:
+- The `test-sync-data` ConfigMap created in the Source cluster should automatically appear in the Destination cluster within seconds.
+- If you update the ConfigMap in the Source cluster, the changes should reflect in the Destination cluster.
+- If you delete it from the Source cluster, it should be removed from the Destination cluster.

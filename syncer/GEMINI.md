@@ -18,6 +18,7 @@ This project is a standard Kubernetes controller built using `controller-runtime
 *   `controllers/`: Contains the reconciliation logic (`KRMSyncerReconciler`).
 *   `config/`: Kustomize configuration for deploying the controller and CRDs.
 *   `main.go`: The entry point for the controller manager.
+*   `cmd/krmsyncer/`: The `krmsyncer` CLI (`krmsyncer sync` deploys the controller into a destination GKE cluster). Must be run from the `syncer` directory.
 
 ## Key Components
 

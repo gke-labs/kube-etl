@@ -20,3 +20,4 @@ The project is organized into the following components:
     *   **main.go**: The entry point for the controller manager.
     *   **api/**: API definitions for the controller.
     *   **controllers/**: Controller logic for copying kube objects between clusters.
+    *   **cmd/krmsyncer/**: The `krmsyncer` CLI for deploying the controller (run from the `krmsyncer` directory).

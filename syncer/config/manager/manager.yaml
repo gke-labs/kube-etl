@@ -3,13 +3,13 @@ kind: Namespace
 metadata:
   labels:
     control-plane: controller-manager
-  name: system
+  name: krmsyncer-system
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: controller-manager
-  namespace: system
+  name: krmsyncer-controller-manager
+  namespace: krmsyncer-system
   labels:
     control-plane: controller-manager
 spec:
@@ -45,5 +45,5 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
-      serviceAccountName: controller-manager
+      serviceAccountName: krmsyncer-controller-manager
       terminationGracePeriodSeconds: 10

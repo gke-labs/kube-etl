@@ -1,5 +1,5 @@
 # Adds namespace to all resources.
-namespace: system
+namespace: krmsyncer-system
 
 resources:
 - ../crd
