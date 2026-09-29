@@ -16,7 +16,7 @@ The project is organized into the following components:
     *   **main.go**: The main entry point for the `kube-etl` CLI.
     *   **pkg/export/**: Logic for exporting Kubernetes objects.
     *   **pkg/sink/**: Interfaces and implementations for data sinks (e.g., ZipSink).
-*   **syncer/**: This directory contains the `KRMSyncer` controller (module `github.com/gke-labs/kube-etl/syncer`).
+*   **krmsyncer/**: This directory contains the `KRMSyncer` controller (module `github.com/gke-labs/kube-etl/krmsyncer`).
     *   **main.go**: The entry point for the controller manager.
     *   **api/**: API definitions for the controller.
     *   **controllers/**: Controller logic for copying kube objects between clusters.
