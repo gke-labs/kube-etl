@@ -49,29 +49,45 @@ spec:
               remote:
                 description: Remote defines the remote cluster for the sync.
                 properties:
-                  clusterConfig:
-                    description: ClusterConfig defines the configuration for syncing
-                      with a remote Kubernetes cluster.
+                  gkeCluster:
+                    description: |-
+                      GKECluster references a remote GKE cluster. The controller authenticates
+                      to it using its own Google identity (Workload Identity or Application
+                      Default Credentials), so no credentials need to be stored in the cluster.
                     properties:
-                      kubeConfigSecretRef:
+                      endpoint:
+                        default: Default
                         description: |-
-                          KubeConfigSecretRef is the reference to the secret containing the
-                          kubeconfig of the remote cluster.
-                        properties:
-                          name:
-                            description: name is unique within a namespace to reference
-                              a secret resource.
-                            type: string
-                          namespace:
-                            description: namespace defines the space within which
-                              the secret name must be unique.
-                            type: string
-                        type: object
-                        x-kubernetes-map-type: atomic
+                          Endpoint selects the control plane endpoint used to reach the cluster:
+                          Default, DNS or PrivateIP.
+                        enum:
+                        - Default
+                        - DNS
+                        - PrivateIP
+                        type: string
+                      location:
+                        description: Location is the region or zone of the cluster,
+                          e.g. "us-central1".
+                        minLength: 1
+                        type: string
+                      name:
+                        description: Name is the name of the cluster.
+                        minLength: 1
+                        type: string
+                      project:
+                        description: Project is the ID of the Google Cloud project
+                          that hosts the cluster.
+                        minLength: 1
+                        type: string
                     required:
-                    - kubeConfigSecretRef
+                    - location
+                    - name
+                    - project
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: a remote cluster must be specified (gkeCluster)
+                  rule: has(self.gkeCluster)
               rules:
                 description: Rules defines which resources to watch and sync. If unset,
                   sync all resources by default.

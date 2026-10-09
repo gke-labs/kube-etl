@@ -28,7 +28,6 @@ import (
 	"testing"
 	"time"
 
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/klog/v2"
 
 	"github.com/stretchr/testify/require"
@@ -39,7 +38,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -55,6 +53,37 @@ var (
 	mgrCtx          context.Context
 	mgrCancel       context.CancelFunc
 )
+
+// destClusterName is the fake GKE cluster name that tests resolve to the
+// envtest destination cluster.
+const destClusterName = "dest"
+
+// testConfigProvider resolves fake GKE clusters (by name) to envtest clusters.
+type testConfigProvider struct {
+	clusters map[string]*rest.Config
+}
+
+// Key uses the same connection key as the GKE provider.
+func (p *testConfigProvider) Key(namespace string, remote *krmv1alpha1.RemoteConfig) (string, error) {
+	return (&GKEConfigProvider{}).Key(namespace, remote)
+}
+
+func (p *testConfigProvider) RESTConfig(_ context.Context, _ string, remote *krmv1alpha1.RemoteConfig) (*rest.Config, error) {
+	if _, err := gkeClusterName(remote); err != nil {
+		return nil, err
+	}
+	cfg, ok := p.clusters[remote.GKECluster.Name]
+	if !ok {
+		return nil, fmt.Errorf("unknown test cluster %q", remote.GKECluster.Name)
+	}
+	return rest.CopyConfig(cfg), nil
+}
+
+func testRemote(name string) *krmv1alpha1.RemoteConfig {
+	return &krmv1alpha1.RemoteConfig{
+		GKECluster: &krmv1alpha1.GKECluster{Project: "test-project", Location: "us-central1", Name: name},
+	}
+}
 
 func TestMain(m *testing.M) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
@@ -120,9 +149,10 @@ func TestMain(m *testing.M) {
 	}
 
 	if err := (&KRMSyncerReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Manager: mgr,
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		Manager:              mgr,
+		RemoteConfigProvider: &testConfigProvider{clusters: map[string]*rest.Config{destClusterName: cfgDest}},
 	}).SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to setup controller: %v\n", err)
 		os.Exit(1)
@@ -153,20 +183,8 @@ func TestSyncerSync(t *testing.T) {
 	ctx := t.Context()
 	// Test Logic
 	ns := "default"
-	secretName := "dest-kubeconfig"
 	syncerName := "test-syncer"
 	targetServiceName := "target-service"
-
-	// Generate kubeconfig from envtest Dest config
-	destKubeconfigContent, err := createKubeconfig(cfgDest)
-	require.NoError(t, err)
-
-	// Create Secret in Source with Dest Kubeconfig
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
-		Data:       map[string][]byte{"kubeconfig": destKubeconfigContent},
-	}
-	require.NoError(t, k8sClientSource.Create(ctx, secret))
 
 	// Create Syncer
 	syncer := &krmv1alpha1.KRMSyncer{
@@ -174,11 +192,7 @@ func TestSyncerSync(t *testing.T) {
 		Spec: krmv1alpha1.KRMSyncerSpec{
 			Suspend: false,
 			Mode:    krmv1alpha1.ModePush,
-			Remote: &krmv1alpha1.RemoteConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
-				},
-			},
+			Remote:  testRemote(destClusterName),
 			Rules: []krmv1alpha1.ResourceRule{
 				{
 					Group: "", Version: "v1", Kind: "Service",
@@ -200,7 +214,7 @@ func TestSyncerSync(t *testing.T) {
 	require.NoError(t, k8sClientSource.Create(ctx, target))
 
 	// Verify Service Sync to Dest
-	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
 		destSvc := &corev1.Service{}
 		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
 		if err != nil {
@@ -242,29 +256,15 @@ func TestSyncerSyncFields(t *testing.T) {
 	ctx := t.Context()
 	// Test Logic
 	ns := "default"
-	secretName := "dest-kubeconfig-fields"
 	syncerName := "test-syncer-fields"
 	targetName := "test-service-fields"
-
-	destKubeconfigContent, err := createKubeconfig(cfgDest)
-	require.NoError(t, err)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
-		Data:       map[string][]byte{"kubeconfig": destKubeconfigContent},
-	}
-	require.NoError(t, k8sClientSource.Create(ctx, secret))
 
 	// Create Syncer with SyncFields
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Mode: krmv1alpha1.ModePush,
-			Remote: &krmv1alpha1.RemoteConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
-				},
-			},
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destClusterName),
 			Rules: []krmv1alpha1.ResourceRule{
 				{
 					Group: "", Version: "v1", Kind: "Service",
@@ -293,7 +293,7 @@ func TestSyncerSyncFields(t *testing.T) {
 	require.NoError(t, k8sClientSource.Create(ctx, target))
 
 	// Verify Sync to Dest: spec should be present with nested fields
-	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
 		destSvc := &corev1.Service{}
 		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetName, Namespace: ns}, destSvc)
 		if err != nil {
@@ -312,18 +312,8 @@ func TestSyncerSyncStatusSubresource(t *testing.T) {
 	ctx := t.Context()
 	// Test Logic: Sync Service itself (it has status subresource)
 	ns := "default"
-	secretName := "dest-kubeconfig-status"
 	syncerName := "test-syncer-status"
 	observedServiceName := "observed-service"
-
-	destKubeconfigContent, err := createKubeconfig(cfgDest)
-	require.NoError(t, err)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
-		Data:       map[string][]byte{"kubeconfig": destKubeconfigContent},
-	}
-	require.NoError(t, k8sClientSource.Create(ctx, secret))
 
 	// Create observed service FIRST
 	observed := &corev1.Service{
@@ -339,12 +329,8 @@ func TestSyncerSyncStatusSubresource(t *testing.T) {
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Mode: krmv1alpha1.ModePush,
-			Remote: &krmv1alpha1.RemoteConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
-				},
-			},
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destClusterName),
 			Rules: []krmv1alpha1.ResourceRule{
 				{
 					Group: "", Version: "v1", Kind: "Service",
@@ -357,7 +343,7 @@ func TestSyncerSyncStatusSubresource(t *testing.T) {
 	require.NoError(t, k8sClientSource.Create(ctx, syncer))
 
 	// Wait for initial sync of observed service (spec only)
-	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
 		destSvc := &corev1.Service{}
 		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: observedServiceName, Namespace: ns}, destSvc)
 		return err == nil, nil
@@ -391,12 +377,8 @@ func TestSyncerValidation(t *testing.T) {
 	validSyncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: "valid-syncer", Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Mode: krmv1alpha1.ModePush,
-			Remote: &krmv1alpha1.RemoteConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: "dummy", Namespace: ns},
-				},
-			},
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote("dummy"),
 			Rules: []krmv1alpha1.ResourceRule{
 				{
 					Group: "syncer.gkelabs.io", Version: "v1alpha1", Kind: "KRMSyncer",
@@ -411,12 +393,8 @@ func TestSyncerValidation(t *testing.T) {
 	defaultSyncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: "default-syncer", Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Mode: krmv1alpha1.ModePush,
-			Remote: &krmv1alpha1.RemoteConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: "dummy", Namespace: ns},
-				},
-			},
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote("dummy"),
 			Rules: []krmv1alpha1.ResourceRule{
 				{
 					Group: "syncer.gkelabs.io", Version: "v1alpha1", Kind: "KRMSyncer",
@@ -428,34 +406,86 @@ func TestSyncerValidation(t *testing.T) {
 	assert.Equal(t, []string{"status"}, defaultSyncer.Spec.Rules[0].SyncFields)
 }
 
+func TestSyncerRemoteValidation(t *testing.T) {
+	ctx := t.Context()
+	ns := "default"
+
+	gkeCluster := func(extra map[string]any) map[string]any {
+		c := map[string]any{"project": "test-project", "location": "us-central1", "name": "dest"}
+		for k, v := range extra {
+			c[k] = v
+		}
+		return c
+	}
+
+	for _, tc := range []struct {
+		name    string
+		remote  any // nil omits spec.remote entirely
+		wantErr string
+	}{
+		{
+			name:    "no remote",
+			remote:  nil,
+			wantErr: "spec.remote: Required value",
+		},
+		{
+			name:    "invalid endpoint",
+			remote:  map[string]any{"gkeCluster": gkeCluster(map[string]any{"endpoint": "PublicIP"})},
+			wantErr: `spec.remote.gkeCluster.endpoint: Unsupported value: "PublicIP"`,
+		},
+		{
+			name:   "valid, endpoint defaulted",
+			remote: map[string]any{"gkeCluster": gkeCluster(nil)},
+		},
+		{
+			name:   "valid, DNS endpoint",
+			remote: map[string]any{"gkeCluster": gkeCluster(map[string]any{"endpoint": "DNS"})},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := map[string]any{
+				"mode":  "pull",
+				"rules": []any{map[string]any{"group": "", "version": "v1", "kind": "ConfigMap"}},
+			}
+			if tc.remote != nil {
+				spec["remote"] = tc.remote
+			}
+			u := &unstructured.Unstructured{Object: map[string]any{"spec": spec}}
+			u.SetGroupVersionKind(krmv1alpha1.GroupVersion.WithKind("KRMSyncer"))
+			u.SetGenerateName("remote-validation-")
+			u.SetNamespace(ns)
+			// Suspend so the controller does not try to connect to the remote.
+			require.NoError(t, unstructured.SetNestedField(u.Object, true, "spec", "suspend"))
+
+			err := k8sClientSource.Create(ctx, u)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				defer func() { _ = k8sClientSource.Delete(ctx, u) }()
+				endpoint, _, _ := unstructured.NestedString(u.Object, "spec", "remote", "gkeCluster", "endpoint")
+				if tc.name == "valid, endpoint defaulted" {
+					assert.Equal(t, string(krmv1alpha1.GKEEndpointDefault), endpoint)
+				}
+				return
+			}
+			require.Error(t, err)
+			assert.True(t, errors.IsInvalid(err), "expected Invalid, got %v", err)
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
 func TestSyncerPull(t *testing.T) {
 	ctx := t.Context()
 	ns := "default"
-	secretName := "remote-kubeconfig-pull"
 	syncerName := "test-syncer-pull"
 	targetServiceName := "target-service-pull"
-
-	// Generate kubeconfig from envtest Dest config (which acts as Remote in Pull mode)
-	remoteKubeconfigContent, err := createKubeconfig(cfgDest)
-	require.NoError(t, err)
-
-	// Create Secret in Source (Local) with Remote Kubeconfig
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
-		Data:       map[string][]byte{"kubeconfig": remoteKubeconfigContent},
-	}
-	require.NoError(t, k8sClientSource.Create(ctx, secret))
 
 	// Create Syncer in Pull mode
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
-			Mode: krmv1alpha1.ModePull,
-			Remote: &krmv1alpha1.RemoteConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
-				},
-			},
+			Mode:   krmv1alpha1.ModePull,
+			Remote: testRemote(destClusterName),
 			Rules: []krmv1alpha1.ResourceRule{
 				{
 					Group: "", Version: "v1", Kind: "Service",
@@ -477,7 +507,7 @@ func TestSyncerPull(t *testing.T) {
 	require.NoError(t, k8sClientDest.Create(ctx, target))
 
 	// Verify Service Sync from Remote to Local (cfgSource)
-	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
 		localSvc := &corev1.Service{}
 		err := k8sClientSource.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, localSvc)
 		if err != nil {
@@ -616,49 +646,9 @@ func TestFilterFields(t *testing.T) {
 	assert.Len(t, listVal, 2)
 }
 
-func createKubeconfig(cfg *rest.Config) ([]byte, error) {
-	clusterName := "default-cluster"
-	userName := "default-user"
-	contextName := "default-context"
-
-	clusters := make(map[string]*clientcmdapi.Cluster)
-	clusters[clusterName] = &clientcmdapi.Cluster{
-		Server:                   cfg.Host,
-		CertificateAuthorityData: cfg.CAData,
-		InsecureSkipTLSVerify:    cfg.Insecure,
-	}
-
-	authInfos := make(map[string]*clientcmdapi.AuthInfo)
-	authInfos[userName] = &clientcmdapi.AuthInfo{
-		ClientCertificateData: cfg.CertData,
-		ClientKeyData:         cfg.KeyData,
-		Token:                 cfg.BearerToken,
-		Username:              cfg.Username,
-		Password:              cfg.Password,
-	}
-
-	contexts := make(map[string]*clientcmdapi.Context)
-	contexts[contextName] = &clientcmdapi.Context{
-		Cluster:  clusterName,
-		AuthInfo: userName,
-	}
-
-	config := clientcmdapi.Config{
-		Kind:           "Config",
-		APIVersion:     "v1",
-		Clusters:       clusters,
-		AuthInfos:      authInfos,
-		Contexts:       contexts,
-		CurrentContext: contextName,
-	}
-
-	return clientcmd.Write(config)
-}
-
 func TestSyncerSyncMissingNamespace(t *testing.T) {
 	ctx := t.Context()
 	ns := "missing-dest-ns"
-	secretName := "dest-kubeconfig-missing-ns"
 	syncerName := "test-syncer-missing-ns"
 	targetServiceName := "target-service-missing-ns"
 
@@ -677,28 +667,13 @@ func TestSyncerSyncMissingNamespace(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.IsNotFound(err))
 
-	// 3. Generate kubeconfig from envtest Dest config
-	destKubeconfigContent, err := createKubeconfig(cfgDest)
-	require.NoError(t, err)
-
-	// Create Secret in Source with Dest Kubeconfig
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
-		Data:       map[string][]byte{"kubeconfig": destKubeconfigContent},
-	}
-	require.NoError(t, k8sClientSource.Create(ctx, secret))
-
 	// Create Syncer
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
 		Spec: krmv1alpha1.KRMSyncerSpec{
 			Suspend: false,
 			Mode:    krmv1alpha1.ModePush,
-			Remote: &krmv1alpha1.RemoteConfig{
-				ClusterConfig: &krmv1alpha1.ClusterConfig{
-					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: ns},
-				},
-			},
+			Remote:  testRemote(destClusterName),
 			Rules: []krmv1alpha1.ResourceRule{
 				{
 					Group: "", Version: "v1", Kind: "Service",
@@ -737,7 +712,6 @@ func TestSyncerSyncMissingNamespace(t *testing.T) {
 	// Cleanup
 	require.NoError(t, k8sClientSource.Delete(ctx, target))
 	require.NoError(t, k8sClientSource.Delete(ctx, syncer))
-	require.NoError(t, k8sClientSource.Delete(ctx, secret))
 	// Cleanup destination namespace
 	_ = k8sClientDest.Delete(ctx, destNamespace)
 }

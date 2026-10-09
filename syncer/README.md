@@ -18,7 +18,7 @@ The operator manages the `KRMSyncer` Custom Resource to coordinate resource repl
 1.  **Reconciling (Active cluster)**:
     *   Watches specific Kubernetes resources defined in rules.
     *   Continuously syncs their state directly to the destination.
-    *   Requires a `Secret` containing the Kubeconfig of the remote cluster.
+    *   The remote cluster is a GKE cluster referenced directly in the spec; the controller authenticates with its own Google Workload Identity.
     *   Default mode is `pull`.
 
 2.  **Suspended (Passive cluster)**:
@@ -45,10 +45,12 @@ spec:
     - group: "networking.k8s.io"
       version: "v1"
       kind: "Ingress"
-  remote: # Renamed field!
-    clusterConfig:
-      kubeConfigSecretRef:
-        name: "remote-cluster-kubeconfig"
+  remote:
+    gkeCluster:
+      project: my-project
+      location: us-central1
+      name: remote-cluster
+      endpoint: Default # Optional. Default | DNS | PrivateIP
 ```
 ## Run Integration test
 ```bash
@@ -60,8 +62,18 @@ make test-integration
 ## Getting Started
 
 ### 1. Prerequisites
-- **Remote Cluster Secret**: A Secret in the same namespace as the `KRMSyncer` resource containing the `kubeconfig` key with the target cluster's configuration.
+- **Remote GKE cluster**: The remote cluster must be a GKE cluster. It is referenced in `spec.remote.gkeCluster` by project, location and name.
+- **Control plane endpoint**: `spec.remote.gkeCluster.endpoint` selects how the controller reaches the remote cluster:
+  - `Default` (default): the cluster's default endpoint, the same one `gcloud container clusters get-credentials` uses.
+  - `DNS`: the cluster's DNS-based endpoint (it must be enabled on the cluster). This works from anywhere with IAM-based access and needs no VPC connectivity.
+  - `PrivateIP`: the cluster's private endpoint. The controller must have network connectivity to the cluster's VPC.
+- **Google service account for the controller**: The controller authenticates to the GKE API and the remote cluster with Application Default Credentials. On GKE, the `krmsyncer-system/krmsyncer-controller-manager` Kubernetes service account must impersonate a Google service account (GSA) through [Workload Identity Federation for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) (see "Link Kubernetes ServiceAccounts to IAM").
+  - `container.clusters.get` on the remote cluster's project (e.g. `roles/container.clusterViewer`), the controller also uses it to look up the cluster endpoint and CA.
+  - Kubernetes RBAC on the remote cluster to read (pull mode) or write (push mode) the synced resources, bound to the GSA's email as a `User` subject.
 - **RBAC**: The operator needs permissions to read the resources defined in the rules and to manage `Syncer` resources.
+
+> [!WARNING]
+> All `KRMSyncer` objects share the controller's Google identity. Anyone who can create a `KRMSyncer` can sync with any cluster that identity can access, so restrict who can create `KRMSyncer` objects.
 
 ### 2. Build and Deploy
 
@@ -81,31 +93,28 @@ go run main.go
 
 ### 3. Usage Example: Cross-Cluster Sync
 
-1. **Extract the Remote Kubeconfig**:
-    1. Find the remote cluster context name:
-       ```bash
-       kubectl config get-contexts
-       ```
-
-    2. Export the context to file:
-       ```bash
-       kubectl config view --context=<REMOTE_CONTEXT_NAME> --minify --flatten > remote-kubeconfig.yaml
-       * Replace <REMOTE_CONTEXT_NAME> with the name found above
-       * --minify: Only includes the information for that specific context.
-       * --flatten: Embeds the certificate data directly into the file so it doesn't rely on external file paths.
-       ```
-
-    3. Verify the file:
-       ```bash
-       kubectl --kubeconfig=remote-kubeconfig.yaml get nodes
-       ```
-       If this command works, `remote-kubeconfig.yaml` is ready to be used.
-
-1. **Create the Kubeconfig Secret** (on the Local cluster):
+1. **Set up a Google service account for the controller** (in the Local cluster's project):
     ```bash
-    kubectl create secret generic remote-kubeconfig \
-      --from-file=kubeconfig=remote-kubeconfig.yaml
+    gcloud iam service-accounts create krmsyncer --project=<LOCAL_PROJECT>
+
+    # Allow the controller's Kubernetes service account to impersonate the GSA.
+    gcloud iam service-accounts add-iam-policy-binding krmsyncer@<LOCAL_PROJECT>.iam.gserviceaccount.com \
+      --role=roles/iam.workloadIdentityUser \
+      --member="serviceAccount:<LOCAL_PROJECT>.svc.id.goog[krmsyncer-system/krmsyncer-controller-manager]"
+
+    kubectl annotate serviceaccount krmsyncer-controller-manager -n krmsyncer-system \
+      iam.gke.io/gcp-service-account=krmsyncer@<LOCAL_PROJECT>.iam.gserviceaccount.com
     ```
+    Instead of `kubectl annotate`, you can set the annotation in [`config/rbac/service_account.yaml`](config/rbac/service_account.yaml) before deploying.
+
+1. **Grant the GSA access to the Remote cluster**:
+    ```bash
+    # Required to authenticate to the remote cluster and to look up its endpoint and CA.
+    gcloud projects add-iam-policy-binding <REMOTE_PROJECT> \
+      --role=roles/container.clusterViewer \
+      --member=serviceAccount:krmsyncer@<LOCAL_PROJECT>.iam.gserviceaccount.com
+    ```
+    Then grant the GSA Kubernetes RBAC on the Remote cluster for the resources being synced, using its email as a `User` subject.
 
 1. **Apply the Syncer Resource** (on the Local cluster):
     ```yaml
@@ -123,9 +132,10 @@ go run main.go
           kind: "ConfigMap"
           namespaces: ["default"] # Only sync ConfigMaps in the 'default' namespace
       remote:
-        clusterConfig:
-          kubeConfigSecretRef:
-            name: "remote-kubeconfig"
+        gkeCluster:
+          project: <REMOTE_PROJECT>
+          location: <REMOTE_LOCATION>
+          name: <REMOTE_CLUSTER>
 
     ```
     ```bash

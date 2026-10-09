@@ -7,9 +7,10 @@ spec:
   suspend: true
   mode: push
   remote:
-    clusterConfig:
-      kubeConfigSecretRef:
-        name: dest-kubeconfig
+    gkeCluster:
+      project: test-project
+      location: us-central1
+      name: cluster-b
   rules:
   - group: e2e.gkelabs.io
     version: v1alpha1
