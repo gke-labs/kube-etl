@@ -223,8 +223,10 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		// Use ServerGroupsAndResources to get all versions
-		_, resourceLists, err = dc.ServerGroupsAndResources()
+		// Use ServerPreferredResources so each resource is returned once, in its preferred
+		// version. Objects are readable through any served version, so watching every
+		// served version would sync each object multiple times and race on the destination.
+		resourceLists, err = dc.ServerPreferredResources()
 		if err != nil {
 			if !discovery.IsGroupDiscoveryFailedError(err) {
 				return ctrl.Result{}, err
