@@ -15,7 +15,6 @@
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -50,17 +49,50 @@ const (
 )
 
 // RemoteConfig defines the remote cluster configuration.
+// Exactly one remote cluster type must be set.
 // +kubebuilder:object:generate=true
+// +kubebuilder:validation:XValidation:rule="has(self.gkeCluster)",message="a remote cluster must be specified (gkeCluster)"
 type RemoteConfig struct {
+	// GKECluster references a remote GKE cluster. The controller authenticates
+	// to it using its own Google identity (Workload Identity or Application
+	// Default Credentials), so no credentials need to be stored in the cluster.
 	// +optional
-	// ClusterConfig defines the configuration for syncing with a remote Kubernetes cluster.
-	ClusterConfig *ClusterConfig `json:"clusterConfig,omitempty"`
+	GKECluster *GKECluster `json:"gkeCluster,omitempty"`
 }
 
-type ClusterConfig struct {
-	// KubeConfigSecretRef is the reference to the secret containing the
-	// kubeconfig of the remote cluster.
-	KubeConfigSecretRef *corev1.SecretReference `json:"kubeConfigSecretRef"`
+// GKEEndpoint selects which control plane endpoint of a GKE cluster to use.
+type GKEEndpoint string
+
+const (
+	// GKEEndpointDefault uses the cluster's default control plane endpoint,
+	// the same one `gcloud container clusters get-credentials` uses.
+	GKEEndpointDefault GKEEndpoint = "Default"
+	// GKEEndpointDNS uses the cluster's DNS-based control plane endpoint.
+	// The DNS endpoint must be enabled on the cluster.
+	GKEEndpointDNS GKEEndpoint = "DNS"
+	// GKEEndpointPrivateIP uses the cluster's private control plane IP. The
+	// controller must have network connectivity to the cluster's VPC.
+	GKEEndpointPrivateIP GKEEndpoint = "PrivateIP"
+)
+
+// GKECluster identifies a GKE cluster.
+// +kubebuilder:object:generate=true
+type GKECluster struct {
+	// Project is the ID of the Google Cloud project that hosts the cluster.
+	// +kubebuilder:validation:MinLength=1
+	Project string `json:"project"`
+	// Location is the region or zone of the cluster, e.g. "us-central1".
+	// +kubebuilder:validation:MinLength=1
+	Location string `json:"location"`
+	// Name is the name of the cluster.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// Endpoint selects the control plane endpoint used to reach the cluster:
+	// Default, DNS or PrivateIP.
+	// +optional
+	// +kubebuilder:validation:Enum=Default;DNS;PrivateIP
+	// +kubebuilder:default=Default
+	Endpoint GKEEndpoint `json:"endpoint,omitempty"`
 }
 
 // KRMSyncerSpec defines the desired state.

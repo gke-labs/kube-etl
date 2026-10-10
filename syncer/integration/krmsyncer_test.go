@@ -23,14 +23,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"io"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -96,6 +93,8 @@ func TestKRMSyncerIntegration(t *testing.T) {
 		Client:  mgr.GetClient(),
 		Scheme:  mgr.GetScheme(),
 		Manager: mgr,
+		// Resolve the GKE cluster referenced by the test cases to Cluster B.
+		RemoteConfigProvider: staticConfigProvider{cfg: configB},
 	}
 	require.NoError(t, reconciler.SetupWithManager(mgr))
 
@@ -108,23 +107,7 @@ func TestKRMSyncerIntegration(t *testing.T) {
 		}
 	}()
 
-	// 3. Setup Synchronization (Kubeconfig Secret)
-	t.Log("Creating Kubeconfig Secret...")
-	destKubeconfig, err := createKubeconfig(configB)
-	require.NoError(t, err)
-
-	secret := &corev1.Secret{
-		ObjectMeta: ctrl.ObjectMeta{
-			Name:      "dest-kubeconfig",
-			Namespace: "default",
-		},
-		Data: map[string][]byte{
-			"kubeconfig": destKubeconfig,
-		},
-	}
-	require.NoError(t, k8sClientA.Create(ctx, secret))
-
-	// 4. Run Test Cases
+	// 3. Run Test Cases
 	casesDir := "../integration/cases"
 	dirs, err := os.ReadDir(casesDir)
 	require.NoError(t, err)
@@ -268,24 +251,19 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 	}
 }
 
-func createKubeconfig(cfg *rest.Config) ([]byte, error) {
-	config := clientcmdapi.NewConfig()
-	config.Clusters["cluster"] = &clientcmdapi.Cluster{
-		Server:                   cfg.Host,
-		CertificateAuthorityData: cfg.CAData,
-		InsecureSkipTLSVerify:    cfg.Insecure,
+// staticConfigProvider resolves every remote cluster to a fixed envtest cluster.
+type staticConfigProvider struct {
+	cfg *rest.Config
+}
+
+// Key uses the same connection key as the GKE provider.
+func (p staticConfigProvider) Key(namespace string, remote *krmv1alpha1.RemoteConfig) (string, error) {
+	return (&controllers.GKEConfigProvider{}).Key(namespace, remote)
+}
+
+func (p staticConfigProvider) RESTConfig(_ context.Context, _ string, remote *krmv1alpha1.RemoteConfig) (*rest.Config, error) {
+	if remote == nil || remote.GKECluster == nil {
+		return nil, fmt.Errorf("spec.remote.gkeCluster must be set")
 	}
-	config.AuthInfos["user"] = &clientcmdapi.AuthInfo{
-		ClientCertificateData: cfg.CertData,
-		ClientKeyData:         cfg.KeyData,
-		Token:                 cfg.BearerToken,
-		Username:              cfg.Username,
-		Password:              cfg.Password,
-	}
-	config.Contexts["default"] = &clientcmdapi.Context{
-		Cluster:  "cluster",
-		AuthInfo: "user",
-	}
-	config.CurrentContext = "default"
-	return clientcmd.Write(*config)
+	return rest.CopyConfig(p.cfg), nil
 }

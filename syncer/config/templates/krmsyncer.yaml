@@ -1,0 +1,28 @@
+# Sample KRMSyncer CR that syncs all Config Connector (KCC) resources from the
+# source cluster. The controller expands the glob using the source cluster's
+# API discovery; globs are only supported for KCC groups with version and kind
+# both set to "*". The '*' values must be quoted in YAML.
+# The source cluster is referenced directly; the controller looks up its
+# endpoint and CA through the GKE API and authenticates with Workload Identity.
+# Placeholders are filled in by render_template in krmsyncer.sh.
+apiVersion: syncer.gkelabs.io/v1alpha1
+kind: KRMSyncer
+metadata:
+  name: ${SYNC_CONFIG_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  mode: pull
+  suspend: false
+  remote:
+    gkeCluster:
+      project: ${SOURCE_PROJECT}
+      location: ${SOURCE_LOCATION}
+      name: ${SOURCE_CLUSTER}
+      endpoint: ${SOURCE_ENDPOINT}
+  rules:
+  - group: "*.cnrm.cloud.google.com"
+    version: "*"
+    kind: "*"
+    syncFields:
+    - spec
+    - status
