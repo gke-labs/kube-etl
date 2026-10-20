@@ -46,6 +46,9 @@ func (c *remoteClientCache) get(ctx context.Context, namespace string, remote *k
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.clients == nil {
+		c.clients = make(map[string]client.Client)
+	}
 	if cl, ok := c.clients[key]; ok {
 		return cl, nil
 	}

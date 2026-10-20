@@ -33,6 +33,10 @@ spec:
         - --v=2
         image: controller:latest
         name: manager
+        ports:
+        - containerPort: 8080
+          name: metrics
+          protocol: TCP
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

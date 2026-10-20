@@ -34,6 +34,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -61,7 +62,9 @@ type KRMSyncerReconciler struct {
 	// SyncPeriod determines the minimum frequency at which watched resources are reconciled
 	// in remote cluster caches.
 	SyncPeriod *time.Duration
-	mu         sync.RWMutex
+	// MaxConcurrentReconciles is the maximum number of concurrent reconciles for dynamic controllers.
+	MaxConcurrentReconciles int
+	mu                      sync.RWMutex
 }
 
 type RemoteGVK struct {
@@ -193,9 +196,6 @@ func (r *KRMSyncerReconciler) expandRule(ctx context.Context, krmsyncer *krmv1al
 func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	mode := krmsyncer.Spec.Mode
 	if mode == "" {
 		mode = krmv1alpha1.ModePull
@@ -249,21 +249,43 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 					Cluster: connKey,
 					GVK:     gvk,
 				}
-				if !r.WatchedRemoteGVKs[rgvk] {
-					if err := r.startRemoteWatcher(ctx, krmsyncer, rgvk); err != nil {
-						logger.Error(err, "Failed to start remote watcher for GVK", "gvk", gvk)
-						continue
-					}
-					r.WatchedRemoteGVKs[rgvk] = true
+				r.mu.Lock()
+				if r.WatchedRemoteGVKs == nil {
+					r.WatchedRemoteGVKs = make(map[RemoteGVK]bool)
+				}
+				if r.WatchedRemoteGVKs[rgvk] {
+					r.mu.Unlock()
+					continue
+				}
+				r.WatchedRemoteGVKs[rgvk] = true
+				r.mu.Unlock()
+
+				if err := r.startRemoteWatcher(ctx, krmsyncer, rgvk); err != nil {
+					logger.Error(err, "Failed to start remote watcher for GVK", "gvk", gvk)
+					r.mu.Lock()
+					delete(r.WatchedRemoteGVKs, rgvk)
+					r.mu.Unlock()
+					continue
 				}
 			} else {
 				// Push mode
-				if !r.WatchedGVKs[gvk] {
-					if err := r.startWatcher(ctx, gvk); err != nil {
-						logger.Error(err, "Failed to start watcher for GVK", "gvk", gvk)
-						continue
-					}
-					r.WatchedGVKs[gvk] = true
+				r.mu.Lock()
+				if r.WatchedGVKs == nil {
+					r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
+				}
+				if r.WatchedGVKs[gvk] {
+					r.mu.Unlock()
+					continue
+				}
+				r.WatchedGVKs[gvk] = true
+				r.mu.Unlock()
+
+				if err := r.startWatcher(ctx, gvk); err != nil {
+					logger.Error(err, "Failed to start watcher for GVK", "gvk", gvk)
+					r.mu.Lock()
+					delete(r.WatchedGVKs, gvk)
+					r.mu.Unlock()
+					continue
 				}
 			}
 		}
@@ -285,10 +307,13 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(gvk)
 
-	return ctrl.NewControllerManagedBy(r.Manager).
+	b := ctrl.NewControllerManagedBy(r.Manager).
 		For(u).
-		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
-		Complete(dr)
+		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind))
+	if r.MaxConcurrentReconciles > 0 {
+		b = b.WithOptions(controller.Options{MaxConcurrentReconciles: r.MaxConcurrentReconciles})
+	}
+	return b.Complete(dr)
 }
 
 func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, rgvk RemoteGVK) error {
@@ -310,18 +335,27 @@ func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer 
 	u.SetGroupVersionKind(rgvk.GVK)
 
 	gvk := rgvk.GVK
-	return ctrl.NewControllerManagedBy(r.Manager).
+	b := ctrl.NewControllerManagedBy(r.Manager).
 		Named(fmt.Sprintf("dynamic-puller-%s-%s-%s-%s", strings.ReplaceAll(rgvk.Cluster, "/", "-"), gvk.Group, gvk.Version, gvk.Kind)).
-		WatchesRawSource(source.Kind[client.Object](remoteCluster.GetCache(), u, &handler.EnqueueRequestForObject{})).
-		Complete(dr)
+		WatchesRawSource(source.Kind[client.Object](remoteCluster.GetCache(), u, &handler.EnqueueRequestForObject{}))
+	if r.MaxConcurrentReconciles > 0 {
+		b = b.WithOptions(controller.Options{MaxConcurrentReconciles: r.MaxConcurrentReconciles})
+	}
+	return b.Complete(dr)
 }
 
 func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, key, namespace string, remote *krmv1alpha1.RemoteConfig) (cluster.Cluster, error) {
 	logger := log.FromContext(ctx)
 
+	r.mu.Lock()
+	if r.RemoteClusters == nil {
+		r.RemoteClusters = make(map[string]cluster.Cluster)
+	}
 	if c, ok := r.RemoteClusters[key]; ok {
+		r.mu.Unlock()
 		return c, nil
 	}
+	r.mu.Unlock()
 
 	restConfig, err := r.RemoteConfigProvider.RESTConfig(ctx, namespace, remote)
 	if err != nil {
@@ -349,7 +383,13 @@ func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, key,
 		return nil, fmt.Errorf("failed to sync remote cluster cache")
 	}
 
+	r.mu.Lock()
+	if existing, ok := r.RemoteClusters[key]; ok {
+		r.mu.Unlock()
+		return existing, nil
+	}
 	r.RemoteClusters[key] = c
+	r.mu.Unlock()
 	return c, nil
 }
 
@@ -357,10 +397,12 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.RemoteConfigProvider == nil {
 		r.RemoteConfigProvider = &GKEConfigProvider{}
 	}
+	r.mu.Lock()
 	r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
 	r.WatchedRemoteGVKs = make(map[RemoteGVK]bool)
 	r.RemoteClusters = make(map[string]cluster.Cluster)
 	r.remoteClients = newRemoteClientCache(r.RemoteConfigProvider)
+	r.mu.Unlock()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&krmv1alpha1.KRMSyncer{}).
 		Complete(r)
@@ -482,13 +524,21 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				toDelete.SetNamespace(req.Namespace)
 
 				logger.Info("Deleting resource on destination cluster", "name", req.Name, "namespace", req.Namespace)
+				start := time.Now()
 				if err := destClient.Delete(ctx, toDelete); err != nil {
 					if !errors.IsNotFound(err) {
 						// TODO: report failure in syncer status
 						logger.Error(err, "Failed to delete resource on destination cluster")
 						recordSyncFailure(r.GVK, OperationDelete)
+						recordSyncLatency(r.GVK, OperationDelete, time.Since(start).Seconds())
 						syncErrors = append(syncErrors, err)
+					} else {
+						recordSyncSuccess(r.GVK, OperationDelete)
+						recordSyncLatency(r.GVK, OperationDelete, time.Since(start).Seconds())
 					}
+				} else {
+					recordSyncSuccess(r.GVK, OperationDelete)
+					recordSyncLatency(r.GVK, OperationDelete, time.Since(start).Seconds())
 				}
 				continue
 			}
@@ -577,6 +627,7 @@ func isFullSync(fields []string) bool {
 }
 
 func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, destClient client.Client, obj *unstructured.Unstructured) error {
+	startApply := time.Now()
 	// Ensure destination namespace exists before applying the resource.
 	nsName := obj.GetNamespace()
 	if nsName != "" {
@@ -589,12 +640,14 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 						Name: nsName,
 					},
 				}
-				if err := destClient.Create(ctx, ns); err != nil {
+				if err := destClient.Create(ctx, ns); err != nil && !errors.IsAlreadyExists(err) {
 					recordSyncFailure(r.GVK, OperationApply)
+					recordSyncLatency(r.GVK, OperationApply, time.Since(startApply).Seconds())
 					return fmt.Errorf("failed to create destination namespace %q: %v", nsName, err)
 				}
 			} else {
 				recordSyncFailure(r.GVK, OperationApply)
+				recordSyncLatency(r.GVK, OperationApply, time.Since(startApply).Seconds())
 				return fmt.Errorf("failed to check destination namespace %q: %v", nsName, err)
 			}
 		}
@@ -607,17 +660,22 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 	status, found, err := unstructured.NestedFieldCopy(obj.Object, "status")
 	if err != nil {
 		recordSyncFailure(r.GVK, OperationApply)
+		recordSyncLatency(r.GVK, OperationApply, time.Since(startApply).Seconds())
 		return fmt.Errorf("failed to copy status: %v", err)
 	}
 
 	// Use Server-Side Apply (SSA) to create or update the resource.
 	if err := destClient.Patch(ctx, obj, client.Apply, patchOpts...); err != nil {
 		recordSyncFailure(r.GVK, OperationApply)
+		recordSyncLatency(r.GVK, OperationApply, time.Since(startApply).Seconds())
 		return fmt.Errorf("failed to apply object to destination: %v", err)
 	}
+	recordSyncSuccess(r.GVK, OperationApply)
+	recordSyncLatency(r.GVK, OperationApply, time.Since(startApply).Seconds())
 
 	// If status is present, we also need to patch the status subresource.
 	if found {
+		startStatus := time.Now()
 		statusObj := &unstructured.Unstructured{
 			Object: map[string]any{
 				"apiVersion": obj.GetAPIVersion(),
@@ -635,8 +693,11 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 		}
 		if err := destClient.Status().Patch(ctx, statusObj, client.Apply, subResourcePatchOpts...); err != nil {
 			recordSyncFailure(r.GVK, OperationStatus)
+			recordSyncLatency(r.GVK, OperationStatus, time.Since(startStatus).Seconds())
 			return fmt.Errorf("failed to apply status subresource to destination: %v", err)
 		}
+		recordSyncSuccess(r.GVK, OperationStatus)
+		recordSyncLatency(r.GVK, OperationStatus, time.Since(startStatus).Seconds())
 	}
 	return nil
 }

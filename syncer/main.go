@@ -32,6 +32,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	krmSyncer "github.com/gke-labs/kube-etl/syncer/controllers"
 )
@@ -57,7 +58,13 @@ func main() {
 
 func run(ctx context.Context) error {
 	var syncPeriod time.Duration
+	var metricsAddr string
+	var maxConcurrentReconciles int
+
 	flag.DurationVar(&syncPeriod, "sync-period", 0, "The minimum frequency at which watched resources are reconciled (0 or negative disables periodic sync)")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
+	flag.StringVar(&metricsAddr, "metrics-address", ":8080", "The address the metric endpoint binds to (alias for --metrics-bind-address).")
+	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum number of concurrent reconciles for dynamic controllers.")
 
 	// Configure logging
 	klogFlagSet := goflag.NewFlagSet("klog", goflag.ExitOnError)
@@ -77,6 +84,9 @@ func run(ctx context.Context) error {
 
 	mgrOpts := ctrl.Options{
 		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: metricsAddr,
+		},
 	}
 	if syncPeriodOpt != nil {
 		mgrOpts.Cache = cache.Options{
@@ -94,10 +104,11 @@ func run(ctx context.Context) error {
 	// Create and set up the SyncerReconciler
 	setupLog.Info("Creating SyncerReconciler")
 	if err = (&krmSyncer.KRMSyncerReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		Manager:    mgr,
-		SyncPeriod: syncPeriodOpt,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Manager:                 mgr,
+		SyncPeriod:              syncPeriodOpt,
+		MaxConcurrentReconciles: maxConcurrentReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Syncer")
 		return err

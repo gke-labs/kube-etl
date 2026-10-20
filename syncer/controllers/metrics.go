@@ -35,12 +35,39 @@ var (
 		},
 		[]string{"group", "version", "kind", "operation"},
 	)
+
+	// SyncSuccessTotal counts the total number of successful syncs, partitioned by GVK and operation.
+	SyncSuccessTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "syncer_sync_success_total",
+			Help: "Total number of successful syncs, partitioned by GVK and operation.",
+		},
+		[]string{"group", "version", "kind", "operation"},
+	)
+
+	// SyncLatency records the duration of sync operations in seconds, partitioned by GVK and operation.
+	SyncLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "syncer_sync_latency_seconds",
+			Help:    "Total time to sync a resource in seconds, partitioned by GVK and operation.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"group", "version", "kind", "operation"},
+	)
 )
 
 func init() {
-	metrics.Registry.MustRegister(SyncFailuresTotal)
+	metrics.Registry.MustRegister(SyncFailuresTotal, SyncSuccessTotal, SyncLatency)
 }
 
 func recordSyncFailure(gvk schema.GroupVersionKind, operation string) {
 	SyncFailuresTotal.WithLabelValues(gvk.Group, gvk.Version, gvk.Kind, operation).Inc()
+}
+
+func recordSyncSuccess(gvk schema.GroupVersionKind, operation string) {
+	SyncSuccessTotal.WithLabelValues(gvk.Group, gvk.Version, gvk.Kind, operation).Inc()
+}
+
+func recordSyncLatency(gvk schema.GroupVersionKind, operation string, durationSeconds float64) {
+	SyncLatency.WithLabelValues(gvk.Group, gvk.Version, gvk.Kind, operation).Observe(durationSeconds)
 }

@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
@@ -27,6 +28,7 @@ import (
 
 // countingProvider uses GKE connection keys and counts RESTConfig calls.
 type countingProvider struct {
+	mu    sync.Mutex
 	calls int
 	fail  bool
 }
@@ -36,12 +38,21 @@ func (p *countingProvider) Key(namespace string, remote *krmv1alpha1.RemoteConfi
 }
 
 func (p *countingProvider) RESTConfig(_ context.Context, _ string, _ *krmv1alpha1.RemoteConfig) (*rest.Config, error) {
+	p.mu.Lock()
 	p.calls++
-	if p.fail {
+	fail := p.fail
+	p.mu.Unlock()
+	if fail {
 		return nil, fmt.Errorf("boom")
 	}
 	// client.New does not contact the server, so any host works.
 	return &rest.Config{Host: "https://127.0.0.1:1"}, nil
+}
+
+func (p *countingProvider) getCalls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
 }
 
 func TestRemoteClientCache(t *testing.T) {
@@ -58,12 +69,12 @@ func TestRemoteClientCache(t *testing.T) {
 	c2, err := c.get(ctx, "ns2", dflt)
 	require.NoError(t, err)
 	assert.Same(t, c1, c2, "same connection key should reuse the client")
-	assert.Equal(t, 1, p.calls)
+	assert.Equal(t, 1, p.getCalls())
 
 	c3, err := c.get(ctx, "ns1", dns)
 	require.NoError(t, err)
 	assert.NotSame(t, c1, c3, "a different endpoint should get its own client")
-	assert.Equal(t, 2, p.calls)
+	assert.Equal(t, 2, p.getCalls())
 
 	// Errors are returned and not cached.
 	failing := &countingProvider{fail: true}
@@ -72,10 +83,39 @@ func TestRemoteClientCache(t *testing.T) {
 	assert.Error(t, err)
 	_, err = fc.get(ctx, "ns1", dflt)
 	assert.Error(t, err)
-	assert.Equal(t, 2, failing.calls)
+	assert.Equal(t, 2, failing.getCalls())
 
 	// Invalid remotes fail before building a config.
 	_, err = c.get(ctx, "ns1", nil)
 	assert.Error(t, err)
-	assert.Equal(t, 2, p.calls)
+	assert.Equal(t, 2, p.getCalls())
+}
+
+func TestRemoteClientCache_Concurrent(t *testing.T) {
+	ctx := t.Context()
+	p := &countingProvider{}
+	c := newRemoteClientCache(p)
+
+	dflt := gkeRemote("p", "us-central1", "c")
+	const concurrency = 50
+	var wg sync.WaitGroup
+	clients := make([]any, concurrency)
+
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			cl, err := c.get(ctx, fmt.Sprintf("ns-%d", idx), dflt)
+			require.NoError(t, err)
+			clients[idx] = cl
+		}(i)
+	}
+	wg.Wait()
+
+	// All concurrent callers should receive the identical client instance for the same remote key.
+	first := clients[0]
+	for i := 1; i < concurrency; i++ {
+		assert.Same(t, first, clients[i], "concurrent gets for same key should return same client instance")
+	}
+	assert.Equal(t, 1, p.getCalls(), "RESTConfig should be called only once despite concurrent requests")
 }

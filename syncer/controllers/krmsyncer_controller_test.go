@@ -23,15 +23,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"k8s.io/client-go/rest"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/spf13/pflag"
 	"k8s.io/klog/v2"
@@ -41,6 +44,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -48,6 +52,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
@@ -202,11 +207,12 @@ func TestMain(m *testing.M) {
 	}
 
 	krmReconciler = &KRMSyncerReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		Manager:              mgr,
-		RemoteConfigProvider: testRemoteProvider,
-		SyncPeriod:           &testSyncPeriod,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Manager:                 mgr,
+		RemoteConfigProvider:    testRemoteProvider,
+		SyncPeriod:              &testSyncPeriod,
+		MaxConcurrentReconciles: 10,
 	}
 	if err := krmReconciler.SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to setup controller: %v\n", err)
@@ -1146,4 +1152,211 @@ func TestSyncPeriodConfigurable(t *testing.T) {
 		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 8080, nil
 	})
 	assert.NoError(t, err, "SyncPeriod should automatically trigger cache resync and restore destination object")
+}
+
+func TestMaxConcurrentReconcilesAndMetricsFlags(t *testing.T) {
+	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	var maxConcurrentReconciles int
+	var metricsBindAddr string
+	var metricsAddr string
+
+	fs.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum number of concurrent reconciles for dynamic controllers")
+	fs.StringVar(&metricsBindAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
+	fs.StringVar(&metricsAddr, "metrics-address", ":8080", "The address the metric endpoint binds to (alias for --metrics-bind-address).")
+
+	assert.Equal(t, 10, maxConcurrentReconciles)
+	assert.Equal(t, ":8080", metricsBindAddr)
+	assert.Equal(t, ":8080", metricsAddr)
+
+	err := fs.Parse([]string{"--max-concurrent-reconciles=20", "--metrics-bind-address=:9090"})
+	assert.NoError(t, err)
+	assert.Equal(t, 20, maxConcurrentReconciles)
+	assert.Equal(t, ":9090", metricsBindAddr)
+
+	err = fs.Parse([]string{"--metrics-address=:9191"})
+	assert.NoError(t, err)
+	assert.Equal(t, ":9191", metricsAddr)
+
+	r := &KRMSyncerReconciler{
+		MaxConcurrentReconciles: 12,
+	}
+	assert.Equal(t, 12, r.MaxConcurrentReconciles)
+}
+
+func TestMetricsAppearOnMetricsEndpoint(t *testing.T) {
+	recordSyncFailure(schema.GroupVersionKind{Group: "test", Version: "v1", Kind: "MetricKind"}, OperationApply)
+	recordSyncSuccess(schema.GroupVersionKind{Group: "test", Version: "v1", Kind: "MetricKind"}, OperationApply)
+	recordSyncLatency(schema.GroupVersionKind{Group: "test", Version: "v1", Kind: "MetricKind"}, OperationApply, 0.05)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, "syncer_sync_failures_total", "failures metric should appear on /metrics")
+	assert.Contains(t, body, "syncer_sync_success_total", "success metric should appear on /metrics")
+	assert.Contains(t, body, "syncer_sync_latency_seconds", "latency metric should appear on /metrics")
+}
+
+func TestSyncMetricsRecorded(t *testing.T) {
+	ctx := t.Context()
+	ns := "sync-metrics-e2e-ns"
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: "syncer-metrics-test", Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destClusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"spec"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+
+	svcName := "test-svc-metrics"
+	initialSuccess := testutil.ToFloat64(SyncSuccessTotal.WithLabelValues("", "v1", "Service", OperationApply))
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: svcName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 8080}},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, svc))
+
+	destSvc := &corev1.Service{}
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: svcName, Namespace: ns}, destSvc)
+		if err != nil {
+			return false, nil
+		}
+		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 8080, nil
+	})
+	require.NoError(t, err, "Service should be synced to destination")
+
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		currentSuccess := testutil.ToFloat64(SyncSuccessTotal.WithLabelValues("", "v1", "Service", OperationApply))
+		return currentSuccess > initialSuccess, nil
+	})
+	assert.NoError(t, err, "SyncSuccessTotal for Service apply should increment")
+
+	// Verify delete metric
+	initialDeleteSuccess := testutil.ToFloat64(SyncSuccessTotal.WithLabelValues("", "v1", "Service", OperationDelete))
+	require.NoError(t, k8sClientSource.Delete(ctx, svc))
+
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: svcName, Namespace: ns}, destSvc)
+		return errors.IsNotFound(err), nil
+	})
+	require.NoError(t, err, "Service should be deleted on destination")
+
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		currentDeleteSuccess := testutil.ToFloat64(SyncSuccessTotal.WithLabelValues("", "v1", "Service", OperationDelete))
+		return currentDeleteSuccess > initialDeleteSuccess, nil
+	})
+	assert.NoError(t, err, "SyncSuccessTotal for Service delete should increment")
+}
+
+func TestConcurrencySafetyKRMSyncerReconciler(t *testing.T) {
+	ctx := t.Context()
+	r := &KRMSyncerReconciler{
+		Scheme:               scheme.Scheme,
+		RemoteConfigProvider: testRemoteProvider,
+		RemoteClusters:       make(map[string]cluster.Cluster),
+		WatchedGVKs:          make(map[schema.GroupVersionKind]bool),
+		WatchedRemoteGVKs:    make(map[RemoteGVK]bool),
+	}
+
+	const concurrency = 20
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			remoteConfig := testRemote(destClusterName)
+			key := fmt.Sprintf("cluster-%d", idx%3)
+			c, err := r.getOrCreateRemoteCluster(ctx, key, "default", remoteConfig)
+			require.NoError(t, err)
+			require.NotNil(t, c)
+
+			gvk := schema.GroupVersionKind{Group: "test", Version: "v1", Kind: fmt.Sprintf("Kind%d", idx%5)}
+			r.mu.Lock()
+			r.WatchedGVKs[gvk] = true
+			_ = r.WatchedGVKs[gvk]
+			r.mu.Unlock()
+
+			rgvk := RemoteGVK{Cluster: key, GVK: gvk}
+			r.mu.Lock()
+			r.WatchedRemoteGVKs[rgvk] = true
+			_ = r.WatchedRemoteGVKs[rgvk]
+			r.mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestConcurrentResourceReconciliation(t *testing.T) {
+	ctx := t.Context()
+	ns := "concurrent-sync-ns"
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: "syncer-concurrent-test", Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destClusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"spec"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+
+	const count = 10
+	for i := 0; i < count; i++ {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("concurrent-svc-%d", i),
+				Namespace: ns,
+			},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{{Port: int32(8000 + i)}},
+			},
+		}
+		require.NoError(t, k8sClientSource.Create(ctx, svc))
+		defer func(s *corev1.Service) { _ = k8sClientSource.Delete(ctx, s) }(svc)
+	}
+
+	// Verify all 10 Services are synced concurrently to destination
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 20*time.Second, true, func(ctx context.Context) (bool, error) {
+		for i := 0; i < count; i++ {
+			destSvc := &corev1.Service{}
+			if err := k8sClientDest.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("concurrent-svc-%d", i), Namespace: ns}, destSvc); err != nil {
+				return false, nil
+			}
+			if len(destSvc.Spec.Ports) == 0 || destSvc.Spec.Ports[0].Port != int32(8000+i) {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	assert.NoError(t, err, "All concurrently created Services should be synced to destination")
 }
