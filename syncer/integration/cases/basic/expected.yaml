@@ -3,5 +3,7 @@ kind: TestCRD
 metadata:
   name: integration-test
   namespace: default
+spec:
+  foo: "standby-spec"
 status:
   bar: "initial-status"

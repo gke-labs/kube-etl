@@ -1147,3 +1147,169 @@ func TestSyncPeriodConfigurable(t *testing.T) {
 	})
 	assert.NoError(t, err, "SyncPeriod should automatically trigger cache resync and restore destination object")
 }
+
+func TestSyncerMissingDestinationObjectStatusMode(t *testing.T) {
+	ctx := t.Context()
+	ns := "missing-dest-status-ns"
+	syncerName := "test-syncer-missing-dest"
+	targetServiceName := "target-svc-missing-dest"
+
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	// Ensure destination namespace does NOT exist
+	destNamespace := &corev1.Namespace{}
+	err := k8sClientDest.Get(ctx, types.NamespacedName{Name: ns}, destNamespace)
+	require.True(t, errors.IsNotFound(err))
+
+	initialFailures := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationApply))
+
+	// Create Syncer with status-only sync
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destClusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"status"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+
+	// Create target Service in Source with spec and status
+	target := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
+			Type:  corev1.ServiceTypeLoadBalancer,
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, target))
+	defer func() { _ = k8sClientSource.Delete(ctx, target) }()
+
+	target.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "1.2.3.4"}}
+	require.NoError(t, k8sClientSource.Status().Update(ctx, target))
+
+	// Wait 2 seconds to let the syncer attempt reconciliation
+	time.Sleep(2 * time.Second)
+
+	// Verify that destination namespace was NOT created
+	err = k8sClientDest.Get(ctx, types.NamespacedName{Name: ns}, destNamespace)
+	assert.True(t, errors.IsNotFound(err), "Destination namespace should NOT be created for status sync when object is missing")
+
+	// Verify that destination service does NOT exist (no stub was created)
+	destSvc := &corev1.Service{}
+	err = k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+	assert.True(t, errors.IsNotFound(err), "Destination service should NOT exist as a stub")
+
+	// Verify that no sync failures were counted
+	currentFailures := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationApply))
+	assert.Equal(t, initialFailures, currentFailures, "Failure metric should not be incremented when destination object is missing")
+
+	// Now simulate GitOps creating the namespace and object on the destination cluster (standby)
+	destNsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientDest.Create(ctx, destNsObj))
+	defer func() { _ = k8sClientDest.Delete(ctx, destNsObj) }()
+
+	destTarget := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 8080}},
+			Type:  corev1.ServiceTypeLoadBalancer,
+		},
+	}
+	require.NoError(t, k8sClientDest.Create(ctx, destTarget))
+	defer func() { _ = k8sClientDest.Delete(ctx, destTarget) }()
+
+	// Wait for the syncer to reconcile (via requeue or event) and sync status to destination
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+		if err != nil {
+			return false, nil
+		}
+		return len(destSvc.Status.LoadBalancer.Ingress) > 0 && destSvc.Status.LoadBalancer.Ingress[0].IP == "1.2.3.4", nil
+	})
+	assert.NoError(t, err, "Status should be synced once destination object exists")
+
+	// Verify that destination's spec was preserved and source's spec did NOT overwrite it!
+	assert.Equal(t, int32(8080), destSvc.Spec.Ports[0].Port, "Destination spec port 8080 should be preserved, not overwritten by source port 80")
+}
+
+func TestSyncerStatusModeDoesNotLeakSpec(t *testing.T) {
+	ctx := t.Context()
+	ns := "no-spec-leak-ns"
+	syncerName := "test-syncer-no-leak"
+	targetServiceName := "target-svc-no-leak"
+
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	destNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientDest.Create(ctx, destNamespace))
+	defer func() { _ = k8sClientDest.Delete(ctx, destNamespace) }()
+
+	// Pre-create destination object with destination-specific spec (e.g. from GitOps)
+	destTarget := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Name: "http", Port: 9000}},
+			Type:  corev1.ServiceTypeLoadBalancer,
+		},
+	}
+	require.NoError(t, k8sClientDest.Create(ctx, destTarget))
+	defer func() { _ = k8sClientDest.Delete(ctx, destTarget) }()
+
+	// Create Syncer with status-only sync
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destClusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"status"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+
+	// Create source object with source-specific spec and status
+	sourceTarget := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Name: "http", Port: 80}},
+			Type:  corev1.ServiceTypeLoadBalancer,
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, sourceTarget))
+	defer func() { _ = k8sClientSource.Delete(ctx, sourceTarget) }()
+
+	sourceTarget.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "9.9.9.9"}}
+	require.NoError(t, k8sClientSource.Status().Update(ctx, sourceTarget))
+
+	// Verify status is synced to destination
+	destSvc := &corev1.Service{}
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+		if err != nil {
+			return false, nil
+		}
+		return len(destSvc.Status.LoadBalancer.Ingress) > 0 && destSvc.Status.LoadBalancer.Ingress[0].IP == "9.9.9.9", nil
+	})
+	require.NoError(t, err, "Status should be synced to destination")
+
+	// Assert that source spec (Port 80) NEVER reached destination, and destination port remains 9000
+	assert.Equal(t, int32(9000), destSvc.Spec.Ports[0].Port, "Source spec must not leak to destination in status sync mode")
+}

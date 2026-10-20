@@ -177,6 +177,28 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 		}
 	}()
 
+	// Apply Destination Resources if present (simulating GitOps creating resources on standby)
+	destPath := filepath.Join(caseDir, "dest.yaml")
+	if destBytes, err := os.ReadFile(destPath); err == nil && len(destBytes) > 0 {
+		destDecoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(destBytes), 4096)
+		for {
+			destRes := &unstructured.Unstructured{}
+			if err := destDecoder.Decode(destRes); err != nil {
+				if err == io.EOF {
+					break
+				}
+				require.NoError(t, err)
+			}
+			if destRes.Object == nil {
+				continue
+			}
+			require.NoError(t, destClient.Create(ctx, destRes))
+			defer func() {
+				_ = destClient.Delete(ctx, destRes)
+			}()
+		}
+	}
+
 	// Apply All Resources in Source
 	for _, resource := range resources {
 		t.Logf("Creating Resource %s/%s in Source Cluster...", resource.GetKind(), resource.GetName())

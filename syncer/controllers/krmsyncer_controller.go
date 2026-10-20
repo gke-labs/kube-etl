@@ -215,8 +215,10 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		// Use ServerGroupsAndResources to get all versions
-		_, resourceLists, err = dc.ServerGroupsAndResources()
+		// Use ServerPreferredResources so each resource is returned once, in its preferred
+		// version. Objects are readable through any served version, so watching every
+		// served version would sync each object multiple times and race on the destination.
+		resourceLists, err = dc.ServerPreferredResources()
 		if err != nil {
 			if !discovery.IsGroupDiscoveryFailedError(err) {
 				return ctrl.Result{}, err
@@ -366,6 +368,10 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// RequeueMissingDest is the retry interval when syncing status to a destination
+// object that has not been created yet.
+var RequeueMissingDest = 2 * time.Second
+
 // DynamicResourceReconciler handles events for dynamically watched resources
 type DynamicResourceReconciler struct {
 	LocalClient  client.Client
@@ -418,6 +424,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	var syncErrors []error
+	var requeueAfter time.Duration
 	for _, krmsyncer := range krmsyncers.Items {
 		if krmsyncer.Spec.Suspend {
 			continue
@@ -497,6 +504,9 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Info("Syncing resource to destination cluster", "name", u.GetName(), "namespace", u.GetNamespace())
 
 			syncFields := rule.SyncFields
+			if len(syncFields) == 0 {
+				syncFields = []string{"status"}
+			}
 			destObj, err := r.filterFields(u, syncFields)
 			if err != nil {
 				// TODO: report failure in syncer status
@@ -511,6 +521,29 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			destObj.SetGeneration(0)
 			destObj.SetManagedFields(nil)
 
+			// If spec is not synced (status mode), the destination object must already exist.
+			// Applying a spec-less object would fail CRD validation (422) or create a stub.
+			if !isFullSync(syncFields) {
+				destExisting := &unstructured.Unstructured{}
+				destExisting.SetGroupVersionKind(r.GVK)
+				destKey := client.ObjectKey{
+					Namespace: destObj.GetNamespace(),
+					Name:      destObj.GetName(),
+				}
+				if err := destClient.Get(ctx, destKey, destExisting); err != nil {
+					if errors.IsNotFound(err) {
+						logger.Info("Destination object does not exist yet for status-only sync, requeueing", "name", destObj.GetName(), "namespace", destObj.GetNamespace())
+						if requeueAfter == 0 || RequeueMissingDest < requeueAfter {
+							requeueAfter = RequeueMissingDest
+						}
+						continue
+					}
+					logger.Error(err, "Failed to check destination object")
+					syncErrors = append(syncErrors, err)
+					continue
+				}
+			}
+
 			if err := r.applyToDestination(ctx, destClient, destObj); err != nil {
 				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to apply to destination cluster")
@@ -520,7 +553,13 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 	}
-	return ctrl.Result{}, stderrors.Join(syncErrors...)
+	if len(syncErrors) > 0 {
+		return ctrl.Result{}, stderrors.Join(syncErrors...)
+	}
+	if requeueAfter > 0 {
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
