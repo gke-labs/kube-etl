@@ -474,6 +474,8 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				destClient = r.LocalClient
 			}
 
+			syncerKey := client.ObjectKey{Namespace: krmsyncer.Namespace, Name: krmsyncer.Name}
+
 			// Handle Deletion
 			if isDeleted {
 				toDelete := &unstructured.Unstructured{}
@@ -484,11 +486,13 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				logger.Info("Deleting resource on destination cluster", "name", req.Name, "namespace", req.Namespace)
 				if err := destClient.Delete(ctx, toDelete); err != nil {
 					if !errors.IsNotFound(err) {
-						// TODO: report failure in syncer status
+						r.reportSyncStatus(ctx, syncerKey, true, fmt.Sprintf("Failed to delete resource %s: %v", req.Name, err))
 						logger.Error(err, "Failed to delete resource on destination cluster")
 						recordSyncFailure(r.GVK, OperationDelete)
 						syncErrors = append(syncErrors, err)
 					}
+				} else {
+					r.reportSyncStatus(ctx, syncerKey, false, "")
 				}
 				continue
 			}
@@ -499,7 +503,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			syncFields := rule.SyncFields
 			destObj, err := r.filterFields(u, syncFields)
 			if err != nil {
-				// TODO: report failure in syncer status
+				r.reportSyncStatus(ctx, syncerKey, true, fmt.Sprintf("Failed to filter fields for %s: %v", u.GetName(), err))
 				logger.Error(err, "Failed to filter fields")
 				syncErrors = append(syncErrors, err)
 				continue
@@ -512,15 +516,59 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			destObj.SetManagedFields(nil)
 
 			if err := r.applyToDestination(ctx, destClient, destObj); err != nil {
-				// TODO: report failure in syncer status
+				r.reportSyncStatus(ctx, syncerKey, true, fmt.Sprintf("Failed to apply resource %s to destination cluster: %v", u.GetName(), err))
 				logger.Error(err, "Failed to apply to destination cluster")
 				syncErrors = append(syncErrors, err)
 			} else {
+				r.reportSyncStatus(ctx, syncerKey, false, "")
 				logger.Info("Successfully synced resource to destination cluster", "name", u.GetName(), "namespace", u.GetNamespace())
 			}
 		}
 	}
 	return ctrl.Result{}, stderrors.Join(syncErrors...)
+}
+
+func (r *DynamicResourceReconciler) reportSyncStatus(ctx context.Context, krmsyncerKey client.ObjectKey, isError bool, msg string) {
+	logger := log.FromContext(ctx)
+
+	for i := 0; i < 5; i++ {
+		syncer := &krmv1alpha1.KRMSyncer{}
+		if err := r.LocalClient.Get(ctx, krmsyncerKey, syncer); err != nil {
+			if !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to get KRMSyncer for status update")
+			}
+			return
+		}
+
+		conditionType := "SyncHealthy"
+		var condition metav1.Condition
+		if isError {
+			condition = metav1.Condition{
+				Type:    conditionType,
+				Status:  metav1.ConditionFalse,
+				Reason:  "SyncFailed",
+				Message: msg,
+			}
+		} else {
+			condition = metav1.Condition{
+				Type:    conditionType,
+				Status:  metav1.ConditionTrue,
+				Reason:  "SyncSucceeded",
+				Message: "Sync operations are succeeding",
+			}
+		}
+
+		meta.SetStatusCondition(&syncer.Status.Conditions, condition)
+		err := r.LocalClient.Status().Update(ctx, syncer)
+		if err == nil {
+			return
+		}
+		if !errors.IsConflict(err) {
+			logger.Error(err, "Failed to update KRMSyncer status")
+			return
+		}
+	}
+	logger.Error(fmt.Errorf("max retries reached"), "Failed to update KRMSyncer status due to conflicts")
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
