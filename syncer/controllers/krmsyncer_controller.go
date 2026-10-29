@@ -693,7 +693,8 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 						Name: nsName,
 					},
 				}
-				if err := destClient.Create(ctx, ns); err != nil {
+				// Ignore AlreadyExists: concurrent workers may race to create the same namespace.
+				if err := destClient.Create(ctx, ns); err != nil && !errors.IsAlreadyExists(err) {
 					return fmt.Errorf("failed to create destination namespace %q: %v", nsName, err)
 				}
 			} else {
