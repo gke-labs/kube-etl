@@ -203,11 +203,12 @@ func TestMain(m *testing.M) {
 	}
 
 	krmReconciler = &KRMSyncerReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		Manager:              mgr,
-		RemoteConfigProvider: testRemoteProvider,
-		SyncPeriod:           &testSyncPeriod,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Manager:                 mgr,
+		RemoteConfigProvider:    testRemoteProvider,
+		SyncPeriod:              &testSyncPeriod,
+		MaxConcurrentReconciles: 10,
 	}
 	if err := krmReconciler.SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to setup controller: %v\n", err)
@@ -1123,6 +1124,25 @@ func TestSyncerRetryFailedStatus(t *testing.T) {
 	})
 	assert.NoError(t, err, "Status update should be retried and succeed on dest after recovery")
 	waitForFailedObjects(ctx, t, initialFailed)
+}
+
+func TestControllerOptionsMaxConcurrentReconciles(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{name: "unset defaults to 10", in: 0, want: 10},
+		{name: "negative defaults to 10", in: -1, want: 10},
+		{name: "single worker", in: 1, want: 1},
+		{name: "concurrent workers", in: 8, want: 8},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &KRMSyncerReconciler{MaxConcurrentReconciles: tc.in}
+			assert.Equal(t, tc.want, r.controllerOptions().MaxConcurrentReconciles)
+		})
+	}
 }
 
 func TestSyncPeriodConfigurable(t *testing.T) {
