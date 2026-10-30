@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"slices"
 	"testing"
 	"time"
 )
@@ -149,24 +150,17 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 	}
 
 	// Read all Resources from object.yaml
-	objectPath := "../integration/testdata/object.yaml"
-	createBytes, err := os.ReadFile(objectPath)
-	require.NoError(t, err)
+	resources := readObjects(t, "../integration/testdata/object.yaml")
 
-	resources := []*unstructured.Unstructured{}
-	decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(createBytes), 4096)
-	for {
-		res := &unstructured.Unstructured{}
-		if err := decoder.Decode(res); err != nil {
-			if err == io.EOF {
-				break
-			}
-			require.NoError(t, err)
+	// Read the expected Destination Resources from expected.yaml
+	expectedResources := make(map[string]*unstructured.Unstructured)
+	expectedPath := filepath.Join(caseDir, "expected.yaml")
+	if _, err := os.Stat(expectedPath); err == nil {
+		for _, exp := range readObjects(t, expectedPath) {
+			// Use Kind/Name as key to be safe, although names are unique here
+			key := fmt.Sprintf("%s/%s", exp.GetKind(), exp.GetName())
+			expectedResources[key] = exp
 		}
-		if res.Object == nil {
-			continue
-		}
-		resources = append(resources, res)
 	}
 
 	// Clean up Resources at end of test
@@ -176,6 +170,22 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 			_ = clientB.Delete(ctx, r) // Cleanup on both just in case
 		}
 	}()
+
+	// Status-mode syncers (syncFields without "spec") only update objects that
+	// already exist on the destination. For those, pre-create (without status)
+	// the expected resources in Destination from object.yaml.
+	if isStatusMode(syncer) {
+		for _, resource := range resources {
+			key := fmt.Sprintf("%s/%s", resource.GetKind(), resource.GetName())
+			if _, ok := expectedResources[key]; !ok {
+				continue
+			}
+			t.Logf("Creating Resource %s in Destination Cluster...", key)
+			destObj := resource.DeepCopy()
+			unstructured.RemoveNestedField(destObj.Object, "status")
+			require.NoError(t, destClient.Create(ctx, destObj))
+		}
+	}
 
 	// Apply All Resources in Source
 	for _, resource := range resources {
@@ -201,28 +211,6 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 	time.Sleep(2 * time.Second)
 
 	// Verify Output
-	expectedPath := filepath.Join(caseDir, "expected.yaml")
-	expectedBytes, err := os.ReadFile(expectedPath)
-	expectedResources := make(map[string]*unstructured.Unstructured)
-	if err == nil && len(expectedBytes) > 0 {
-		expDecoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(expectedBytes), 4096)
-		for {
-			exp := &unstructured.Unstructured{}
-			if err := expDecoder.Decode(exp); err != nil {
-				if err == io.EOF {
-					break
-				}
-				require.NoError(t, err)
-			}
-			if exp.Object == nil {
-				continue
-			}
-			// Use Kind/Name as key to be safe, although names are unique here
-			key := fmt.Sprintf("%s/%s", exp.GetKind(), exp.GetName())
-			expectedResources[key] = exp
-		}
-	}
-
 	for _, resource := range resources {
 		key := fmt.Sprintf("%s/%s", resource.GetKind(), resource.GetName())
 		expected, shouldExist := expectedResources[key]
@@ -249,6 +237,40 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 			assert.True(t, errors.IsNotFound(err), "Resource %s should NOT exist in Destination Cluster", key)
 		}
 	}
+}
+
+// isStatusMode reports whether no rule of the syncer syncs the full spec, i.e.
+// the syncer only updates objects that already exist on the destination.
+func isStatusMode(syncer *krmv1alpha1.KRMSyncer) bool {
+	for _, rule := range syncer.Spec.Rules {
+		if slices.Contains(rule.SyncFields, "spec") {
+			return false
+		}
+	}
+	return true
+}
+
+// readObjects decodes all objects from a multi-document YAML file.
+func readObjects(t *testing.T, path string) []*unstructured.Unstructured {
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	objs := []*unstructured.Unstructured{}
+	decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(b), 4096)
+	for {
+		obj := &unstructured.Unstructured{}
+		if err := decoder.Decode(obj); err != nil {
+			if err == io.EOF {
+				break
+			}
+			require.NoError(t, err)
+		}
+		if obj.Object == nil {
+			continue
+		}
+		objs = append(objs, obj)
+	}
+	return objs
 }
 
 // staticConfigProvider resolves every remote cluster to a fixed envtest cluster.

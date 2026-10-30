@@ -4,6 +4,7 @@ metadata:
   name: integration-test
   namespace: default
 spec:
+  foo: "initial-value"
   resourceID: "generated-id"
 status:
   bar: "initial-status"

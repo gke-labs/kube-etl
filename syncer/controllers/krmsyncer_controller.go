@@ -546,6 +546,25 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			destObj.SetGeneration(0)
 			destObj.SetManagedFields(nil)
 
+			// In status mode the syncer only updates objects that already exist on
+			// the destination; it must not create a stub (or its namespace). A
+			// missing destination object is an error, retried until it is created.
+			if !isFullSync(syncFields) {
+				exists, err := destinationExists(ctx, destClient, destObj)
+				if err != nil {
+					logger.Error(err, "Failed to check destination object")
+					syncErrors = append(syncErrors, err)
+					continue
+				}
+				if !exists {
+					err := fmt.Errorf("destination object %s %s/%s does not exist (KRMSyncer %s/%s syncs status only and does not create objects)",
+						r.GVK.Kind, u.GetNamespace(), u.GetName(), krmsyncer.Namespace, krmsyncer.Name)
+					logger.Error(err, "Destination object does not exist")
+					syncErrors = append(syncErrors, err)
+					continue
+				}
+			}
+
 			if err := r.applyToDestination(ctx, destClient, destObj); err != nil {
 				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to apply to destination cluster")
@@ -561,6 +580,20 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	r.failures.markSucceeded(req.NamespacedName)
 	return ctrl.Result{}, nil
+}
+
+// destinationExists reports whether obj exists on the destination cluster.
+func destinationExists(ctx context.Context, destClient client.Client, obj *unstructured.Unstructured) (bool, error) {
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(obj.GroupVersionKind())
+	err := destClient.Get(ctx, client.ObjectKeyFromObject(obj), existing)
+	if err == nil {
+		return true, nil
+	}
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("failed to check destination object: %w", err)
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {

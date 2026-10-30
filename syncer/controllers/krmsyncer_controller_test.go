@@ -791,6 +791,91 @@ func TestSyncerSyncMissingNamespace(t *testing.T) {
 	_ = k8sClientDest.Delete(ctx, destNamespace)
 }
 
+// TestSyncerStatusModeMissingDestination verifies that in status mode (syncFields
+// without "spec") a missing destination object is not created: the sync fails
+// with an error (retried by the workqueue), without creating the namespace, and
+// succeeds once the destination object is created.
+func TestSyncerStatusModeMissingDestination(t *testing.T) {
+	ctx := t.Context()
+	ns := "status-missing-dest-ns"
+	syncerName := "test-syncer-status-missing-dest"
+	targetServiceName := "target-service-status-missing-dest"
+	key := types.NamespacedName{Name: targetServiceName, Namespace: ns}
+
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destClusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"status"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+
+	// Create the source Service with a status.
+	target := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
+			Type:  corev1.ServiceTypeLoadBalancer,
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, target))
+	defer func() { _ = k8sClientSource.Delete(ctx, target) }()
+	target.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "1.2.3.4"}}
+	require.NoError(t, k8sClientSource.Status().Update(ctx, target))
+
+	r := &DynamicResourceReconciler{
+		LocalClient:          k8sClientSource,
+		RemoteClient:         k8sClientSource,
+		RemoteConfigProvider: testRemoteProvider,
+		GVK:                  corev1.SchemeGroupVersion.WithKind("Service"),
+		Mode:                 krmv1alpha1.ModePush,
+	}
+
+	// The destination object does not exist: fail with a (retriable) error.
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	require.Error(t, err, "missing destination object should fail")
+	assert.Contains(t, err.Error(), "does not exist")
+
+	err = k8sClientDest.Get(ctx, types.NamespacedName{Name: ns}, &corev1.Namespace{})
+	assert.True(t, errors.IsNotFound(err), "destination namespace should not be created, got %v", err)
+	err = k8sClientDest.Get(ctx, key, &corev1.Service{})
+	assert.True(t, errors.IsNotFound(err), "destination object should not be created, got %v", err)
+
+	// Create the destination object; the next reconcile syncs its status.
+	destNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientDest.Create(ctx, destNamespace))
+	defer func() { _ = k8sClientDest.Delete(ctx, destNamespace) }()
+	destSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
+			Type:  corev1.ServiceTypeLoadBalancer,
+		},
+	}
+	require.NoError(t, k8sClientDest.Create(ctx, destSvc))
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	require.NoError(t, err)
+	assert.Zero(t, res.RequeueAfter)
+
+	require.NoError(t, k8sClientDest.Get(ctx, key, destSvc))
+	require.Len(t, destSvc.Status.LoadBalancer.Ingress, 1)
+	assert.Equal(t, "1.2.3.4", destSvc.Status.LoadBalancer.Ingress[0].IP)
+}
+
 func TestSyncerRetryFailedApply(t *testing.T) {
 	ctx := t.Context()
 	ns := "retry-apply-ns"
