@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -840,6 +841,7 @@ func TestSyncerRetryFailedApply(t *testing.T) {
 		return testutil.ToFloat64(FailedObjects.WithLabelValues("", "v1", "Service")) > initialFailed, nil
 	})
 	require.NoError(t, err, "Failed objects gauge should count the object while apply is failing")
+	failingSynced := testutil.ToFloat64(SyncedObjects.WithLabelValues("", "v1", "Service"))
 
 	// Verify target service does NOT exist in destination yet
 	destSvc := &corev1.Service{}
@@ -859,6 +861,41 @@ func TestSyncerRetryFailedApply(t *testing.T) {
 	})
 	assert.NoError(t, err, "Service should be retried and successfully synced to dest after recovery")
 	waitForFailedObjects(ctx, t, initialFailed)
+
+	// The recovered object moves from failed to synced.
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		return testutil.ToFloat64(SyncedObjects.WithLabelValues("", "v1", "Service")) == failingSynced+1, nil
+	})
+	assert.NoError(t, err, "Synced objects gauge should count the object after recovery")
+}
+
+func TestSeedPendingObjects(t *testing.T) {
+	ctx := t.Context()
+	ns := "seed-pending-ns"
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	var want []types.NamespacedName
+	for _, name := range []string{"cm-a", "cm-b"} {
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
+		require.NoError(t, k8sClientSource.Create(ctx, cm))
+		want = append(want, types.NamespacedName{Name: name, Namespace: ns})
+	}
+
+	tracker := newObjectSyncTracker(gvk)
+	// cm-a is processed before seeding, so it must not be reported as pending.
+	tracker.markSynced(want[0])
+	seedPendingObjects(ctx, client.NewNamespacedClient(k8sClientSource, ns), gvk, tracker)
+
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	assert.Equal(t, stateSynced, tracker.states[want[0]])
+	assert.Equal(t, statePending, tracker.states[want[1]])
+	assert.Len(t, tracker.states, 2)
+	assert.True(t, tracker.seeded)
 }
 
 func TestSyncerRetryFailedDelete(t *testing.T) {

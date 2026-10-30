@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -308,16 +309,20 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 		remoteClients:        r.remoteClients,
 		GVK:                  gvk,
 		Mode:                 krmv1alpha1.ModePush,
-		failures:             newFailureTracker(failedObjectsGauge(gvk)),
+		syncState:            newObjectSyncTracker(gvk),
 	}
 
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(gvk)
 
-	return ctrl.NewControllerManagedBy(r.Manager).
+	if err := ctrl.NewControllerManagedBy(r.Manager).
 		For(u).
 		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
-		Complete(dr)
+		Complete(dr); err != nil {
+		return err
+	}
+	go seedPendingObjects(ctx, r.Manager.GetCache(), gvk, dr.syncState)
+	return nil
 }
 
 func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, rgvk RemoteGVK) error {
@@ -333,17 +338,39 @@ func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer 
 		GVK:                  rgvk.GVK,
 		Mode:                 krmv1alpha1.ModePull,
 		Remote:               rgvk,
-		failures:             newFailureTracker(failedObjectsGauge(rgvk.GVK)),
+		syncState:            newObjectSyncTracker(rgvk.GVK),
 	}
 
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(rgvk.GVK)
 
 	gvk := rgvk.GVK
-	return ctrl.NewControllerManagedBy(r.Manager).
+	if err := ctrl.NewControllerManagedBy(r.Manager).
 		Named(fmt.Sprintf("dynamic-puller-%s-%s-%s-%s", strings.ReplaceAll(rgvk.Cluster, "/", "-"), gvk.Group, gvk.Version, gvk.Kind)).
 		WatchesRawSource(source.Kind[client.Object](remoteCluster.GetCache(), u, &handler.EnqueueRequestForObject{})).
-		Complete(dr)
+		Complete(dr); err != nil {
+		return err
+	}
+	go seedPendingObjects(ctx, remoteCluster.GetCache(), gvk, dr.syncState)
+	return nil
+}
+
+// seedPendingObjects lists the objects of gvk in the source cache and reports them
+// in syncer_pending_objects until they are processed. This lets syncer_pending_objects
+// tell when the initial sync of a newly started watch has been attempted for every
+// object.
+func seedPendingObjects(ctx context.Context, reader client.Reader, gvk schema.GroupVersionKind, tracker *objectSyncTracker) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+	if err := reader.List(ctx, list); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list source objects; syncer_pending_objects will not report them", "gvk", gvk)
+		return
+	}
+	keys := make([]types.NamespacedName, 0, len(list.Items))
+	for i := range list.Items {
+		keys = append(keys, client.ObjectKeyFromObject(&list.Items[i]))
+	}
+	tracker.seedPending(keys)
 }
 
 func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, key, namespace string, remote *krmv1alpha1.RemoteConfig) (cluster.Cluster, error) {
@@ -410,9 +437,9 @@ type DynamicResourceReconciler struct {
 	// remoteClients caches destination clients (Push mode). If nil, a new
 	// client is built for every event.
 	remoteClients *remoteClientCache
-	// failures tracks objects whose latest sync attempt failed, reported in
-	// syncer_failed_objects. May be nil.
-	failures *failureTracker
+	// syncState tracks the sync state of watched objects, reported in
+	// syncer_{pending,synced,failed}_objects. May be nil.
+	syncState *objectSyncTracker
 }
 
 func (r *DynamicResourceReconciler) ruleMatchesGVK(rule krmv1alpha1.ResourceRule, gvk schema.GroupVersionKind) bool {
@@ -442,7 +469,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			isDeleted = true
 		} else {
 			// The object cannot be synced if it cannot be read from the source.
-			r.failures.markFailed(req.NamespacedName)
+			r.syncState.markFailed(req.NamespacedName)
 			return ctrl.Result{}, err
 		}
 	}
@@ -453,6 +480,8 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
+	// targeted is set if any active KRMSyncer rule targets this object.
+	targeted := false
 	var syncErrors []error
 	for _, krmsyncer := range krmsyncers.Items {
 		if krmsyncer.Spec.Suspend {
@@ -495,6 +524,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					continue
 				}
 			}
+			targeted = true
 
 			// Determine Destination Client
 			var destClient client.Client
@@ -556,10 +586,16 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 	if len(syncErrors) > 0 {
-		r.failures.markFailed(req.NamespacedName)
+		r.syncState.markFailed(req.NamespacedName)
 		return ctrl.Result{}, stderrors.Join(syncErrors...)
 	}
-	r.failures.markSucceeded(req.NamespacedName)
+	if isDeleted || !targeted {
+		// Nothing left to sync: the deletion was propagated, or no active KRMSyncer
+		// targets the object (e.g. filtered by namespace, or its syncer is suspended).
+		r.syncState.forget(req.NamespacedName)
+		return ctrl.Result{}, nil
+	}
+	r.syncState.markSynced(req.NamespacedName)
 	return ctrl.Result{}, nil
 }
 
