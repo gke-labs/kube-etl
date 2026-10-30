@@ -23,8 +23,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"io"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -34,7 +38,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sync"
 	"testing"
 	"time"
 )
@@ -95,6 +101,8 @@ func TestKRMSyncerIntegration(t *testing.T) {
 		Manager: mgr,
 		// Resolve the GKE cluster referenced by the test cases to Cluster B.
 		RemoteConfigProvider: staticConfigProvider{cfg: configB},
+		// Run with concurrent reconciles enabled, as set by --max-concurrent-reconciles.
+		MaxConcurrentReconciles: integrationMaxConcurrentReconciles,
 	}
 	require.NoError(t, reconciler.SetupWithManager(mgr))
 
@@ -121,6 +129,132 @@ func TestKRMSyncerIntegration(t *testing.T) {
 			runTestCase(t, ctx, k8sClientA, k8sClientB, filepath.Join(casesDir, caseName))
 		})
 	}
+
+	// Controller names must be unique per process, so the concurrency test shares
+	// this manager instead of starting its own.
+	t.Run("concurrent-reconciles", func(t *testing.T) {
+		runConcurrentReconcilesTest(t, ctx, k8sClientA, k8sClientB)
+	})
+}
+
+// integrationMaxConcurrentReconciles is the --max-concurrent-reconciles value the
+// integration test runs the syncer with.
+const integrationMaxConcurrentReconciles = 10
+
+// runConcurrentReconcilesTest syncs a burst of objects into a namespace that does
+// not exist in the destination, so concurrent workers race to create it, and
+// verifies that every object syncs without any reconcile errors.
+func runConcurrentReconcilesTest(t *testing.T, ctx context.Context, clientA, clientB client.Client) {
+	const (
+		ns         = "concurrent-reconciles"
+		numObjects = 30
+	)
+	gvk := schema.GroupVersionKind{Group: "e2e.gkelabs.io", Version: "v1alpha1", Kind: "TestCRD"}
+	controllerName := fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)
+
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, clientA.Create(ctx, srcNamespace))
+	defer func() { _ = clientA.Delete(ctx, srcNamespace) }()
+
+	err := clientB.Get(ctx, client.ObjectKey{Name: ns}, &corev1.Namespace{})
+	require.True(t, errors.IsNotFound(err), "destination namespace should not exist yet, got: %v", err)
+	defer func() { _ = clientB.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: "concurrent-syncer", Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode: krmv1alpha1.ModePush,
+			Remote: &krmv1alpha1.RemoteConfig{
+				GKECluster: &krmv1alpha1.GKECluster{Project: "test-project", Location: "us-central1", Name: "cluster-b"},
+			},
+			Rules: []krmv1alpha1.ResourceRule{{
+				Group: gvk.Group, Version: gvk.Version, Kind: gvk.Kind,
+				Namespaces: []string{ns},
+				SyncFields: []string{"spec", "status"},
+			}},
+		},
+	}
+	require.NoError(t, clientA.Create(ctx, syncer))
+	defer func() { _ = clientA.Delete(ctx, syncer) }()
+
+	// Give the syncer time to set up its watches before the burst.
+	time.Sleep(2 * time.Second)
+	initialErrors := controllerMetricValue(t, "controller_runtime_reconcile_errors_total", controllerName)
+
+	// Create the objects in parallel so many reconciles are queued at once.
+	var wg sync.WaitGroup
+	createErrs := make(chan error, numObjects)
+	for i := 0; i < numObjects; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(gvk)
+			obj.SetName(fmt.Sprintf("concurrent-%d", i))
+			obj.SetNamespace(ns)
+			if err := unstructured.SetNestedField(obj.Object, fmt.Sprint(i), "spec", "foo"); err != nil {
+				createErrs <- err
+				return
+			}
+			createErrs <- clientA.Create(ctx, obj)
+		}(i)
+	}
+	wg.Wait()
+	close(createErrs)
+	for err := range createErrs {
+		require.NoError(t, err)
+	}
+
+	// Every object should be synced to the destination with its spec.
+	err = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+		if err := clientB.List(ctx, list, client.InNamespace(ns)); err != nil {
+			return false, nil
+		}
+		return len(list.Items) == numObjects, nil
+	})
+	require.NoError(t, err, "all objects should be synced to the destination")
+
+	for i := 0; i < numObjects; i++ {
+		actual := &unstructured.Unstructured{}
+		actual.SetGroupVersionKind(gvk)
+		require.NoError(t, clientB.Get(ctx, client.ObjectKey{Namespace: ns, Name: fmt.Sprintf("concurrent-%d", i)}, actual))
+		foo, _, _ := unstructured.NestedString(actual.Object, "spec", "foo")
+		assert.Equal(t, fmt.Sprint(i), foo, "spec mismatch for concurrent-%d", i)
+	}
+
+	// The controller should run with concurrent workers, and none of them should
+	// fail, e.g. while racing to create the destination namespace.
+	assert.Equal(t, float64(integrationMaxConcurrentReconciles),
+		controllerMetricValue(t, "controller_runtime_max_concurrent_reconciles", controllerName))
+	assert.Equal(t, initialErrors,
+		controllerMetricValue(t, "controller_runtime_reconcile_errors_total", controllerName),
+		"no reconcile should fail when syncing concurrently")
+}
+
+// controllerMetricValue returns the value of the controller-runtime metric name for
+// the given controller, or 0 if it has not been recorded.
+func controllerMetricValue(t *testing.T, name, controllerName string) float64 {
+	t.Helper()
+	families, err := ctrlmetrics.Registry.Gather()
+	require.NoError(t, err)
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "controller" && l.GetValue() == controllerName {
+					if c := m.GetCounter(); c != nil {
+						return c.GetValue()
+					}
+					return m.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Client, caseDir string) {

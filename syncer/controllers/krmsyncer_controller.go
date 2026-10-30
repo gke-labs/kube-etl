@@ -34,10 +34,17 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
+
+// DefaultMaxConcurrentReconciles is the default number of objects each dynamic
+// resource controller reconciles concurrently. It is the default for the
+// --max-concurrent-reconciles flag and is used when
+// KRMSyncerReconciler.MaxConcurrentReconciles is unset.
+const DefaultMaxConcurrentReconciles = 10
 
 // KRMSyncerReconciler reconciles a KRMSyncer object
 type KRMSyncerReconciler struct {
@@ -64,7 +71,12 @@ type KRMSyncerReconciler struct {
 	// setupFailures tracks KRMSyncers whose latest setup attempt failed, reported in
 	// syncer_setup_failed.
 	setupFailures *failureTracker
-	mu            sync.RWMutex
+	// MaxConcurrentReconciles is the maximum number of objects each dynamic
+	// resource controller reconciles concurrently.
+	// Set from the --max-concurrent-reconciles flag. If unset (<= 0),
+	// DefaultMaxConcurrentReconciles is used.
+	MaxConcurrentReconciles int
+	mu                      sync.RWMutex
 }
 
 type RemoteGVK struct {
@@ -317,7 +329,21 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 	return ctrl.NewControllerManagedBy(r.Manager).
 		For(u).
 		Named(fmt.Sprintf("dynamic-watcher-%s-%s-%s", gvk.Group, gvk.Version, gvk.Kind)).
+		WithOptions(r.controllerOptions()).
 		Complete(dr)
+}
+
+// controllerOptions returns the controller options for the dynamic resource
+// controllers. DynamicResourceReconciler holds no per-object state, so it is
+// safe to reconcile multiple objects concurrently.
+func (r *KRMSyncerReconciler) controllerOptions() controller.Options {
+	n := r.MaxConcurrentReconciles
+	if n <= 0 {
+		n = DefaultMaxConcurrentReconciles
+	}
+	return controller.Options{
+		MaxConcurrentReconciles: n,
+	}
 }
 
 func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, rgvk RemoteGVK) error {
@@ -343,6 +369,7 @@ func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer 
 	return ctrl.NewControllerManagedBy(r.Manager).
 		Named(fmt.Sprintf("dynamic-puller-%s-%s-%s-%s", strings.ReplaceAll(rgvk.Cluster, "/", "-"), gvk.Group, gvk.Version, gvk.Kind)).
 		WatchesRawSource(source.Kind[client.Object](remoteCluster.GetCache(), u, &handler.EnqueueRequestForObject{})).
+		WithOptions(r.controllerOptions()).
 		Complete(dr)
 }
 
@@ -629,7 +656,8 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 						Name: nsName,
 					},
 				}
-				if err := destClient.Create(ctx, ns); err != nil {
+				// Ignore AlreadyExists: concurrent workers may race to create the same namespace.
+				if err := destClient.Create(ctx, ns); err != nil && !errors.IsAlreadyExists(err) {
 					return fmt.Errorf("failed to create destination namespace %q: %v", nsName, err)
 				}
 			} else {

@@ -202,11 +202,12 @@ func TestMain(m *testing.M) {
 	}
 
 	krmReconciler = &KRMSyncerReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		Manager:              mgr,
-		RemoteConfigProvider: testRemoteProvider,
-		SyncPeriod:           &testSyncPeriod,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Manager:                 mgr,
+		RemoteConfigProvider:    testRemoteProvider,
+		SyncPeriod:              &testSyncPeriod,
+		MaxConcurrentReconciles: 10,
 	}
 	if err := krmReconciler.SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to setup controller: %v\n", err)
