@@ -75,4 +75,25 @@ func TestObjectSyncTracker(t *testing.T) {
 	nilTracker.markFailed(a)
 	nilTracker.forget(a)
 	nilTracker.seedPending([]types.NamespacedName{a})
+	nilTracker.seedFailed()
+}
+
+func TestObjectSyncTrackerSeedFailed(t *testing.T) {
+	gvk := schema.GroupVersionKind{Group: "tracker.test", Version: "v1", Kind: "SeedFailed"}
+	tracker := newObjectSyncTracker(gvk)
+	a := types.NamespacedName{Namespace: "ns", Name: "a"}
+	b := types.NamespacedName{Namespace: "ns", Name: "b"}
+
+	tracker.forget(a)
+	tracker.seedFailed()
+	assert.True(t, tracker.seeded)
+	assert.Nil(t, tracker.forgotten)
+
+	// Once seeding has finished, forgotten objects are no longer recorded.
+	tracker.forget(b)
+	assert.Nil(t, tracker.forgotten)
+
+	// Seeding does not happen after it failed.
+	tracker.seedPending([]types.NamespacedName{a, b})
+	assert.Equal(t, 0.0, testutil.ToFloat64(PendingObjects.WithLabelValues(gvk.Group, gvk.Version, gvk.Kind)))
 }

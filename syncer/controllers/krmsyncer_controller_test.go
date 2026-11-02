@@ -886,6 +886,13 @@ func TestSeedPendingObjects(t *testing.T) {
 	}
 
 	tracker := newObjectSyncTracker(gvk)
+	// The tracker updates the shared ConfigMap gauges; remove its counts so they
+	// do not leak into other tests.
+	t.Cleanup(func() {
+		for _, key := range want {
+			tracker.forget(key)
+		}
+	})
 	// cm-a is processed before seeding, so it must not be reported as pending.
 	tracker.markSynced(want[0])
 	seedPendingObjects(ctx, client.NewNamespacedClient(k8sClientSource, ns), gvk, tracker)

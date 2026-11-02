@@ -201,6 +201,13 @@ func (t *objectSyncTracker) seedPending(keys []types.NamespacedName) {
 	t.forgotten = nil
 }
 
+// seedFailed finishes seeding without adding any pending objects, e.g. because
+// the source objects could not be listed. It stops forget from recording objects
+// for a seeding that will never happen. It is a no-op once seeding is done.
+func (t *objectSyncTracker) seedFailed() {
+	t.seedPending(nil)
+}
+
 // markSynced records that the latest sync attempt for key succeeded.
 func (t *objectSyncTracker) markSynced(key types.NamespacedName) {
 	if t == nil {

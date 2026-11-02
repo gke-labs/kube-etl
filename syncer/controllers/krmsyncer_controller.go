@@ -364,6 +364,7 @@ func seedPendingObjects(ctx context.Context, reader client.Reader, gvk schema.Gr
 	list.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
 	if err := reader.List(ctx, list); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to list source objects; syncer_pending_objects will not report them", "gvk", gvk)
+		tracker.seedFailed()
 		return
 	}
 	keys := make([]types.NamespacedName, 0, len(list.Items))
