@@ -32,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/spf13/pflag"
 	"k8s.io/klog/v2"
@@ -794,7 +795,8 @@ func TestSyncerSyncMissingNamespace(t *testing.T) {
 // TestSyncerStatusModeMissingDestination verifies that in status mode (syncFields
 // without "spec") a missing destination object is not created: the sync fails
 // with an error (retried by the workqueue), without creating the namespace, and
-// succeeds once the destination object is created.
+// is counted in syncer_failed_objects until it succeeds once the destination
+// object is created.
 func TestSyncerStatusModeMissingDestination(t *testing.T) {
 	ctx := t.Context()
 	ns := "status-missing-dest-ns"
@@ -835,19 +837,28 @@ func TestSyncerStatusModeMissingDestination(t *testing.T) {
 	defer func() { _ = k8sClientSource.Delete(ctx, target) }()
 	target.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "1.2.3.4"}}
 	require.NoError(t, k8sClientSource.Status().Update(ctx, target))
-
+	failedObjects := prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_failed_objects"})
 	r := &DynamicResourceReconciler{
 		LocalClient:          k8sClientSource,
 		RemoteClient:         k8sClientSource,
 		RemoteConfigProvider: testRemoteProvider,
 		GVK:                  corev1.SchemeGroupVersion.WithKind("Service"),
 		Mode:                 krmv1alpha1.ModePush,
+		failures:             newFailureTracker(failedObjects),
 	}
 
 	// The destination object does not exist: fail with a (retriable) error.
 	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 	require.Error(t, err, "missing destination object should fail")
 	assert.Contains(t, err.Error(), "does not exist")
+	assert.Equal(t, 1.0, testutil.ToFloat64(failedObjects),
+		"missing destination object should be counted as failed")
+
+	// Retrying while the destination object is still missing counts it once.
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	require.Error(t, err, "missing destination object should still fail")
+	assert.Equal(t, 1.0, testutil.ToFloat64(failedObjects),
+		"repeated failures of the same object should be counted once")
 
 	err = k8sClientDest.Get(ctx, types.NamespacedName{Name: ns}, &corev1.Namespace{})
 	assert.True(t, errors.IsNotFound(err), "destination namespace should not be created, got %v", err)
@@ -866,6 +877,7 @@ func TestSyncerStatusModeMissingDestination(t *testing.T) {
 		},
 	}
 	require.NoError(t, k8sClientDest.Create(ctx, destSvc))
+	defer func() { _ = k8sClientDest.Delete(ctx, destSvc) }()
 
 	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 	require.NoError(t, err)
@@ -874,6 +886,10 @@ func TestSyncerStatusModeMissingDestination(t *testing.T) {
 	require.NoError(t, k8sClientDest.Get(ctx, key, destSvc))
 	require.Len(t, destSvc.Status.LoadBalancer.Ingress, 1)
 	assert.Equal(t, "1.2.3.4", destSvc.Status.LoadBalancer.Ingress[0].IP)
+
+	// Once synced, the object is no longer counted as failed.
+	assert.Equal(t, 0.0, testutil.ToFloat64(failedObjects),
+		"synced object should no longer be counted as failed")
 }
 
 func TestSyncerRetryFailedApply(t *testing.T) {

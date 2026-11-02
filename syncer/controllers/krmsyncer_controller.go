@@ -557,8 +557,12 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					continue
 				}
 				if !exists {
-					err := fmt.Errorf("destination object %s %s/%s does not exist (KRMSyncer %s/%s syncs status only and does not create objects)",
-						r.GVK.Kind, u.GetNamespace(), u.GetName(), krmsyncer.Namespace, krmsyncer.Name)
+					name := destObj.GetName()
+					if ns := destObj.GetNamespace(); ns != "" {
+						name = ns + "/" + name
+					}
+					err := fmt.Errorf("destination object %s %s does not exist (KRMSyncer %s/%s syncs status only and does not create objects)",
+						r.GVK.Kind, name, krmsyncer.Namespace, krmsyncer.Name)
 					logger.Error(err, "Destination object does not exist")
 					syncErrors = append(syncErrors, err)
 					continue
