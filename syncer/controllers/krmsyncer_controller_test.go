@@ -362,6 +362,32 @@ func TestSyncerSyncFields(t *testing.T) {
 			destSvc.Spec.Ports[0].Port == 80, nil
 	})
 	assert.NoError(t, err, "Service should be synced to dest with all spec fields")
+
+	// Set a status on the source. Status is not in syncFields, so it must not be synced.
+	require.NoError(t, k8sClientSource.Get(ctx, types.NamespacedName{Name: targetName, Namespace: ns}, target))
+	target.Status.Conditions = []metav1.Condition{{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		Reason:             "Test",
+		LastTransitionTime: metav1.Now(),
+	}}
+	require.NoError(t, k8sClientSource.Status().Update(ctx, target))
+
+	// Update a spec field afterwards; once it shows up in dest, the status
+	// update has been processed as well.
+	require.NoError(t, k8sClientSource.Get(ctx, types.NamespacedName{Name: targetName, Namespace: ns}, target))
+	target.Spec.Selector = map[string]string{"app": "test-fields-updated"}
+	require.NoError(t, k8sClientSource.Update(ctx, target))
+
+	destSvc := &corev1.Service{}
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		if err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetName, Namespace: ns}, destSvc); err != nil {
+			return false, nil
+		}
+		return destSvc.Spec.Selector["app"] == "test-fields-updated", nil
+	})
+	require.NoError(t, err, "Service spec update should be synced to dest")
+	assert.Empty(t, destSvc.Status.Conditions, "status is not in syncFields and must not be synced")
 }
 
 func TestSyncerSyncStatusSubresource(t *testing.T) {
@@ -693,6 +719,9 @@ func TestFilterFields(t *testing.T) {
 					"simple-item",
 				},
 			},
+			"status": map[string]any{
+				"phase": "Active",
+			},
 		},
 	}
 	fieldsFull := []string{"spec"}
@@ -720,6 +749,10 @@ func TestFilterFields(t *testing.T) {
 	listVal, found, _ := unstructured.NestedSlice(destFull.Object, "spec", "list")
 	assert.True(t, found)
 	assert.Len(t, listVal, 2)
+
+	// Status is not in syncFields, so it must not be synced.
+	_, found, _ = unstructured.NestedFieldNoCopy(destFull.Object, "status")
+	assert.False(t, found)
 }
 
 func TestSyncerSyncMissingNamespace(t *testing.T) {

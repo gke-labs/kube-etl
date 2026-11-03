@@ -173,8 +173,18 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 
 	// Status-mode syncers (syncFields without "spec") only update objects that
 	// already exist on the destination. For those, pre-create (without status)
-	// the expected resources in Destination from object.yaml.
-	if isStatusMode(syncer) {
+	// the expected resources in Destination. If the case provides a
+	// destination.yaml, those objects are used (e.g. with spec values that
+	// differ from the source, to verify that fields outside syncFields are not
+	// synced); otherwise the source objects from object.yaml are copied.
+	destinationPath := filepath.Join(caseDir, "destination.yaml")
+	if _, err := os.Stat(destinationPath); err == nil {
+		for _, destObj := range readObjects(t, destinationPath) {
+			t.Logf("Creating Resource %s/%s in Destination Cluster...", destObj.GetKind(), destObj.GetName())
+			unstructured.RemoveNestedField(destObj.Object, "status")
+			require.NoError(t, destClient.Create(ctx, destObj))
+		}
+	} else if isStatusMode(syncer) {
 		for _, resource := range resources {
 			key := fmt.Sprintf("%s/%s", resource.GetKind(), resource.GetName())
 			if _, ok := expectedResources[key]; !ok {
