@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"strings"
 	"sync/atomic"
@@ -48,6 +49,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
@@ -203,11 +205,12 @@ func TestMain(m *testing.M) {
 	}
 
 	krmReconciler = &KRMSyncerReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		Manager:              mgr,
-		RemoteConfigProvider: testRemoteProvider,
-		SyncPeriod:           &testSyncPeriod,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Manager:                 mgr,
+		RemoteConfigProvider:    testRemoteProvider,
+		SyncPeriod:              &testSyncPeriod,
+		MaxConcurrentReconciles: 10,
 	}
 	if err := krmReconciler.SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to setup controller: %v\n", err)
@@ -790,6 +793,76 @@ func TestSyncerSyncMissingNamespace(t *testing.T) {
 	require.NoError(t, k8sClientSource.Delete(ctx, syncer))
 	// Cleanup destination namespace
 	_ = k8sClientDest.Delete(ctx, destNamespace)
+}
+
+// Another worker can create the destination namespace between our Get and our
+// Create. AlreadyExists must neither fail the sync nor count as a failure.
+//
+// The test runs a Pull mode DynamicResourceReconciler end to end (so failures
+// are tracked as in production) against fake clients: the destination reports
+// the namespace missing on Get, then returns AlreadyExists on Create.
+func TestApplyToDestinationIgnoresNamespaceAlreadyExists(t *testing.T) {
+	ctx := t.Context()
+	const ns = "raced-ns"
+	gvk := corev1.SchemeGroupVersion.WithKind("Service")
+	key := types.NamespacedName{Name: "svc", Namespace: ns}
+
+	// Source cluster: the object to sync.
+	source := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 80}}},
+	}).Build()
+
+	// Destination cluster
+	remote := testRemote("source")
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: "syncer", Namespace: "default"},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePull,
+			Remote: remote,
+			Rules: []krmv1alpha1.ResourceRule{
+				{Group: "", Version: "v1", Kind: "Service", Namespaces: []string{ns}, SyncFields: []string{"spec"}},
+			},
+		},
+	}
+	connKey, err := testRemoteProvider.Key(syncer.Namespace, remote)
+	require.NoError(t, err)
+
+	var nsCreateAttempted, applied bool
+	dest := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(syncer).WithInterceptorFuncs(interceptor.Funcs{
+		// Another worker creates ns after our Get found it missing.
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.Namespace); ok && obj.GetName() == ns {
+				nsCreateAttempted = true
+				return errors.NewAlreadyExists(corev1.Resource("namespaces"), ns)
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+		// The fake client does not support server-side apply.
+		Patch: func(_ context.Context, _ client.WithWatch, obj client.Object, _ client.Patch, _ ...client.PatchOption) error {
+			if client.ObjectKeyFromObject(obj) == key {
+				applied = true
+			}
+			return nil
+		},
+	}).Build()
+
+	failedObjects := prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_failed_objects"})
+	r := &DynamicResourceReconciler{
+		LocalClient:          dest,
+		RemoteClient:         source,
+		RemoteConfigProvider: testRemoteProvider,
+		GVK:                  gvk,
+		Mode:                 krmv1alpha1.ModePull,
+		Remote:               RemoteGVK{Cluster: connKey, GVK: gvk},
+		failures:             newFailureTracker(failedObjects),
+	}
+
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	require.NoError(t, err, "AlreadyExists on the destination namespace should not fail the sync")
+	assert.True(t, nsCreateAttempted, "the destination namespace should have been created")
+	assert.True(t, applied, "the object should still be applied after AlreadyExists")
+	assert.Equal(t, 0.0, testutil.ToFloat64(failedObjects), "AlreadyExists must not count as a sync failure")
 }
 
 // TestSyncerStatusModeMissingDestination verifies that in status mode (syncFields
