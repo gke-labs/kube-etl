@@ -510,17 +510,24 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 
 			// Check Namespace match
-			if len(rule.Namespaces) > 0 {
-				matched := false
-				for _, ns := range rule.Namespaces {
-					if ns == req.Namespace {
-						matched = true
-						break
-					}
+			// If the rule does not specify any namespaces, confine the
+			// sync to the KRMSyncer's own namespace. This prevents a
+			// pull-mode remote (which is tenant-controlled) from causing
+			// the controller to apply or delete objects in arbitrary
+			// local namespaces using the controller's credentials.
+			allowedNamespaces := rule.Namespaces
+			if len(allowedNamespaces) == 0 {
+				allowedNamespaces = []string{krmsyncer.Namespace}
+			}
+			matched := false
+			for _, ns := range allowedNamespaces {
+				if ns == req.Namespace {
+					matched = true
+					break
 				}
-				if !matched {
-					continue
-				}
+			}
+			if !matched {
+				continue
 			}
 
 			// Determine Destination Client
