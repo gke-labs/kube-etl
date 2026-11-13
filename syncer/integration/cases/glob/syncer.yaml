@@ -14,5 +14,6 @@ spec:
   - group: "*.cnrm.cloud.google.com"
     version: "*"
     kind: "*"
+    namespaces: ["default"]
     syncFields:
     - "status"

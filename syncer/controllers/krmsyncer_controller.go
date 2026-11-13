@@ -21,6 +21,7 @@ import (
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
@@ -76,7 +78,16 @@ type KRMSyncerReconciler struct {
 	// Set from the --max-concurrent-reconciles flag. If unset (<= 0),
 	// DefaultMaxConcurrentReconciles is used.
 	MaxConcurrentReconciles int
-	mu                      sync.RWMutex
+	// TrustedNamespaces lists the namespaces whose KRMSyncers may sync objects
+	// outside their own namespace: rules that list other namespaces, or
+	// AllNamespaces ("*"). A KRMSyncer in any other namespace that tries is
+	// rejected with an InvalidRule condition. AllNamespaces trusts every
+	// namespace.
+	//
+	// Only cluster administrators should be able to create KRMSyncers in these
+	// namespaces. Set from the --trusted-namespaces flag.
+	TrustedNamespaces []string
+	mu                sync.RWMutex
 }
 
 type RemoteGVK struct {
@@ -123,6 +134,33 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
+	// Reject a KRMSyncer whose rules have missing or malformed namespaces, or
+	// that would make the controller act outside its namespace without being
+	// trusted (see TrustedNamespaces). No watches are started for it, and
+	// DynamicResourceReconciler ignores it.
+	if reason, err := checkNamespaces(&krmSyncer, r.TrustedNamespaces); err != nil {
+		meta.SetStatusCondition(&krmSyncer.Status.Conditions, metav1.Condition{
+			Type:    "InvalidRule",
+			Status:  metav1.ConditionTrue,
+			Reason:  reason,
+			Message: err.Error(),
+		})
+		meta.SetStatusCondition(&krmSyncer.Status.Conditions, metav1.Condition{
+			Type:    "Active",
+			Status:  metav1.ConditionFalse,
+			Reason:  reason,
+			Message: "Nothing is synced until the rules are fixed; see the InvalidRule condition",
+		})
+		r.setupFailures.markFailed(req.NamespacedName)
+		// Retrying cannot help until the KRMSyncer or the controller's trusted
+		// namespaces change, which trigger a new reconcile.
+		return ctrl.Result{}, reconcile.TerminalError(err)
+	}
+	if c := meta.FindStatusCondition(krmSyncer.Status.Conditions, "InvalidRule"); c != nil &&
+		(c.Reason == reasonInvalidNamespaces || c.Reason == reasonNamespaceNotAllowed) {
+		meta.RemoveStatusCondition(&krmSyncer.Status.Conditions, "InvalidRule")
+	}
+
 	meta.SetStatusCondition(&krmSyncer.Status.Conditions, metav1.Condition{
 		Type:    "Active",
 		Status:  metav1.ConditionTrue,
@@ -134,7 +172,7 @@ func (r *KRMSyncerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 func (r *KRMSyncerReconciler) validateRule(rule krmv1alpha1.ResourceRule) error {
-	hasGlob := strings.Contains(rule.Group, "*") || strings.Contains(rule.Version, "*") || strings.Contains(rule.Kind, "*")
+	hasGlob := ruleHasGlob(rule)
 	if hasGlob {
 		isKCC := rule.Group == "*.cnrm.cloud.google.com" ||
 			strings.HasSuffix(rule.Group, ".cnrm.cloud.google.com") ||
@@ -144,6 +182,26 @@ func (r *KRMSyncerReconciler) validateRule(rule krmv1alpha1.ResourceRule) error 
 		}
 	}
 	return nil
+}
+
+// ruleHasGlob reports whether rule's group, version or kind contains a glob.
+func ruleHasGlob(rule krmv1alpha1.ResourceRule) bool {
+	return strings.Contains(rule.Group, "*") || strings.Contains(rule.Version, "*") || strings.Contains(rule.Kind, "*")
+}
+
+// clusterScoped reports whether gvk is a cluster-scoped kind, according to the
+// local cluster's API. A kind the local cluster doesn't serve (e.g. one only
+// the remote cluster has, in pull mode) is reported as namespaced:
+// DynamicResourceReconciler never syncs cluster-scoped objects anyway.
+func (r *KRMSyncerReconciler) clusterScoped(gvk schema.GroupVersionKind) (bool, error) {
+	mapping, err := r.Client.RESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version)
+	if meta.IsNoMatchError(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return mapping.Scope.Name() == meta.RESTScopeNameRoot, nil
 }
 
 func (r *KRMSyncerReconciler) getDiscoveryClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, mode krmv1alpha1.Mode) (discovery.DiscoveryInterface, error) {
@@ -194,6 +252,10 @@ func (r *KRMSyncerReconciler) expandRule(ctx context.Context, krmsyncer *krmv1al
 				if strings.Contains(res.Name, "/") {
 					continue
 				}
+				// Cluster-scoped objects are never synced.
+				if !res.Namespaced {
+					continue
+				}
 				gvks = append(gvks, schema.GroupVersionKind{
 					Group:   gv.Group,
 					Version: gv.Version,
@@ -236,7 +298,7 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 	var resourceLists []*metav1.APIResourceList
 	needsExpansion := false
 	for _, rule := range krmsyncer.Spec.Rules {
-		if strings.Contains(rule.Group, "*") || strings.Contains(rule.Version, "*") || strings.Contains(rule.Kind, "*") {
+		if ruleHasGlob(rule) {
 			needsExpansion = true
 			break
 		}
@@ -260,6 +322,7 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 	}
 
 	var setupErrs []error
+	var clusterScopedKinds []string
 	for _, rule := range krmsyncer.Spec.Rules {
 		gvks, err := r.expandRule(ctx, krmsyncer, rule, mode, resourceLists)
 		if err != nil {
@@ -274,6 +337,22 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 		}
 
 		for _, gvk := range gvks {
+			// Globs skip cluster-scoped kinds (see expandRule). Rules that name
+			// one are reported below: cluster-scoped objects are never synced.
+			if !ruleHasGlob(rule) {
+				scoped, err := r.clusterScoped(gvk)
+				if err != nil {
+					logger.Error(err, "Failed to look up the scope of kind", "gvk", gvk)
+					setupErrs = append(setupErrs, fmt.Errorf("look up the scope of %s: %w", gvk, err))
+					continue
+				}
+				if scoped {
+					if kind := gvk.GroupVersion().String() + " " + gvk.Kind; !slices.Contains(clusterScopedKinds, kind) {
+						clusterScopedKinds = append(clusterScopedKinds, kind)
+					}
+					continue
+				}
+			}
 			if mode == krmv1alpha1.ModePull {
 				connKey, err := r.RemoteConfigProvider.Key(krmsyncer.Namespace, krmsyncer.Spec.Remote)
 				if err != nil {
@@ -307,6 +386,25 @@ func (r *KRMSyncerReconciler) reconcile(ctx context.Context, krmsyncer *krmv1alp
 		}
 	}
 
+	if len(clusterScopedKinds) > 0 {
+		err := fmt.Errorf("rules name cluster-scoped kinds (%s), which are never synced; remove these rules",
+			strings.Join(clusterScopedKinds, ", "))
+		meta.SetStatusCondition(&krmsyncer.Status.Conditions, metav1.Condition{
+			Type:    "InvalidRule",
+			Status:  metav1.ConditionTrue,
+			Reason:  reasonClusterScopedKind,
+			Message: err.Error(),
+		})
+		if len(setupErrs) == 0 {
+			// Retrying cannot help until the rules change. The other rules are
+			// set up and keep syncing.
+			return ctrl.Result{}, reconcile.TerminalError(err)
+		}
+		setupErrs = append(setupErrs, err)
+	} else if c := meta.FindStatusCondition(krmsyncer.Status.Conditions, "InvalidRule"); c != nil && c.Reason == reasonClusterScopedKind {
+		meta.RemoveStatusCondition(&krmsyncer.Status.Conditions, "InvalidRule")
+	}
+
 	// Failed watches are retried with backoff by returning the error. Watches that
 	// started are not restarted.
 	return ctrl.Result{}, stderrors.Join(setupErrs...)
@@ -321,6 +419,7 @@ func (r *KRMSyncerReconciler) startWatcher(ctx context.Context, gvk schema.Group
 		GVK:                  gvk,
 		Mode:                 krmv1alpha1.ModePush,
 		failures:             newFailureTracker(failedObjectsGauge(gvk)),
+		trustedNamespaces:    r.TrustedNamespaces,
 	}
 
 	u := &unstructured.Unstructured{}
@@ -360,6 +459,7 @@ func (r *KRMSyncerReconciler) startRemoteWatcher(ctx context.Context, krmsyncer 
 		Mode:                 krmv1alpha1.ModePull,
 		Remote:               rgvk,
 		failures:             newFailureTracker(failedObjectsGauge(rgvk.GVK)),
+		trustedNamespaces:    r.TrustedNamespaces,
 	}
 
 	u := &unstructured.Unstructured{}
@@ -440,6 +540,10 @@ type DynamicResourceReconciler struct {
 	// failures tracks objects whose latest sync attempt failed, reported in
 	// syncer_failed_objects. May be nil.
 	failures *failureTracker
+	// trustedNamespaces is KRMSyncerReconciler.TrustedNamespaces. KRMSyncers
+	// whose rules have missing or malformed namespaces, or that select objects
+	// outside their namespace without being trusted, are ignored.
+	trustedNamespaces []string
 }
 
 func (r *DynamicResourceReconciler) ruleMatchesGVK(rule krmv1alpha1.ResourceRule, gvk schema.GroupVersionKind) bool {
@@ -485,6 +589,13 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if krmsyncer.Spec.Suspend {
 			continue
 		}
+		// KRMSyncerReconciler rejects a KRMSyncer whose rules have missing or
+		// malformed namespaces, or that selects objects outside its namespace
+		// without being trusted; sync nothing for it, even if a watch for this
+		// GVK was started for another KRMSyncer.
+		if _, err := checkNamespaces(&krmsyncer, r.trustedNamespaces); err != nil {
+			continue
+		}
 
 		// Check Mode match
 		syncerMode := krmsyncer.Spec.Mode
@@ -509,18 +620,9 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				continue
 			}
 
-			// Check Namespace match
-			if len(rule.Namespaces) > 0 {
-				matched := false
-				for _, ns := range rule.Namespaces {
-					if ns == req.Namespace {
-						matched = true
-						break
-					}
-				}
-				if !matched {
-					continue
-				}
+			// Check Namespace match. Cluster-scoped objects never match.
+			if !ruleSelects(rule, req.Namespace) {
+				continue
 			}
 
 			// Determine Destination Client

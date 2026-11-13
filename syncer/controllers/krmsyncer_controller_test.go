@@ -76,6 +76,10 @@ const (
 	destRetryClusterName = "dest-retry"
 )
 
+// trustedTestNamespace is the only namespace the test manager's
+// KRMSyncerReconciler trusts (TrustedNamespaces).
+const trustedTestNamespace = "trusted-syncers"
+
 type faultInjectingRoundTripper struct {
 	base       http.RoundTripper
 	failPatch  atomic.Bool
@@ -211,6 +215,7 @@ func TestMain(m *testing.M) {
 		RemoteConfigProvider:    testRemoteProvider,
 		SyncPeriod:              &testSyncPeriod,
 		MaxConcurrentReconciles: 10,
+		TrustedNamespaces:       []string{trustedTestNamespace},
 	}
 	if err := krmReconciler.SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to setup controller: %v\n", err)
@@ -467,6 +472,7 @@ func TestSyncerValidation(t *testing.T) {
 			Rules: []krmv1alpha1.ResourceRule{
 				{
 					Group: "syncer.gkelabs.io", Version: "v1alpha1", Kind: "KRMSyncer",
+					Namespaces: []string{ns},
 					SyncFields: []string{"spec", "status", "spec.resourceID"},
 				},
 			},
@@ -483,6 +489,7 @@ func TestSyncerValidation(t *testing.T) {
 			Rules: []krmv1alpha1.ResourceRule{
 				{
 					Group: "syncer.gkelabs.io", Version: "v1alpha1", Kind: "KRMSyncer",
+					Namespaces: []string{ns},
 				},
 			},
 		},
@@ -530,7 +537,7 @@ func TestSyncerRemoteValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := map[string]any{
 				"mode":  "pull",
-				"rules": []any{map[string]any{"group": "", "version": "v1", "kind": "ConfigMap"}},
+				"rules": []any{map[string]any{"group": "", "version": "v1", "kind": "ConfigMap", "namespaces": []any{ns}}},
 			}
 			if tc.remote != nil {
 				spec["remote"] = tc.remote
@@ -889,6 +896,8 @@ func TestApplyToDestinationIgnoresNamespaceAlreadyExists(t *testing.T) {
 		Mode:                 krmv1alpha1.ModePull,
 		Remote:               RemoteGVK{Cluster: connKey, GVK: gvk},
 		failures:             newFailureTracker(failedObjects),
+		// The KRMSyncer in "default" syncs another namespace (ns).
+		trustedNamespaces: []string{syncer.Namespace},
 	}
 
 	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})

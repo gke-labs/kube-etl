@@ -14,7 +14,7 @@
 
 # Build the manager binary
 # GO_VERSION should match the `toolchain` directive in go.mod (deploy.sh passes it).
-ARG GO_VERSION=1.27.3
+ARG GO_VERSION=1.27.4
 FROM golang:${GO_VERSION} as builder
 
 WORKDIR /workspace

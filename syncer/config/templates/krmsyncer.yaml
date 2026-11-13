@@ -22,6 +22,13 @@
 # The controller expands the glob using the source cluster's API discovery;
 # globs are only supported for KCC groups with version and kind both set to
 # "*". The '*' values must be quoted in YAML.
+#
+# Every rule needs namespaces. KCC resources live in many namespaces, so every
+# rule (including the appended ones) sets namespaces: ["*"]. "*" is only
+# allowed because the controller trusts this CR's namespace: its own namespace
+# by default (--trusted-namespaces in config/manager/manager.yaml), plus
+# deploy.sh's --namespace if different.
+#
 # The source cluster is referenced directly; the controller looks up its
 # endpoint and CA through the GKE API and authenticates with Workload Identity.
 # Placeholders are filled in by render_template in deploy.sh;
@@ -44,4 +51,5 @@ spec:
   - group: "*.cnrm.cloud.google.com"
     version: "*"
     kind: "*"
+    namespaces: ["*"]
     syncFields: ${SYNC_FIELDS}

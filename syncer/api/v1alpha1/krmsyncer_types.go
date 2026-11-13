@@ -27,9 +27,18 @@ type ResourceRule struct {
 	Version string `json:"version"`
 	// Kind is the Kind of the resource to be synchronized.
 	Kind string `json:"kind"`
-	// Namespaces is an optional list of namespaces to watch. If not provided, all namespaces are synchronized.
-	// +optional
-	Namespaces []string `json:"namespaces,omitempty"`
+	// Namespaces lists the namespaces whose objects this rule syncs, or is
+	// ["*"] to sync every namespace. "*" cannot be combined with other
+	// namespaces. Cluster-scoped objects are never synced.
+	//
+	// A KRMSyncer may always list its own namespace. Listing any other
+	// namespace, or "*", is only allowed if the KRMSyncer is in a namespace the
+	// controller trusts (its --trusted-namespaces flag). Otherwise the
+	// KRMSyncer is rejected with an InvalidRule condition and nothing is synced
+	// for it.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:MinLength=1
+	Namespaces []string `json:"namespaces"`
 	// SyncFields is an optional list of fields to synchronize. If not provided, only the "status" field is synchronized.
 	// Examples: "spec", "status", "spec.resourceID".
 	// +optional
@@ -111,7 +120,8 @@ type KRMSyncerSpec struct {
 	// Remote defines the remote cluster for the sync.
 	Remote *RemoteConfig `json:"remote"`
 
-	// Rules defines which resources to watch and sync. If unset, sync all resources by default.
+	// Rules defines which resources to watch and sync. A KRMSyncer without
+	// rules syncs nothing.
 	Rules []ResourceRule `json:"rules"`
 }
 
