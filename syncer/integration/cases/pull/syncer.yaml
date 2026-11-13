@@ -14,6 +14,7 @@ spec:
   - group: e2e.gkelabs.io
     version: v1alpha1
     kind: TestCRD
+    namespaces: ["default"]
     syncFields:
     - spec
     - status

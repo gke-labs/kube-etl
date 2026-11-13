@@ -89,8 +89,9 @@ spec:
                 - message: a remote cluster must be specified (gkeCluster)
                   rule: has(self.gkeCluster)
               rules:
-                description: Rules defines which resources to watch and sync. If unset,
-                  sync all resources by default.
+                description: |-
+                  Rules defines which resources to watch and sync. A KRMSyncer without
+                  rules syncs nothing.
                 items:
                   description: ResourceRule defines criteria for what to sync.
                   properties:
@@ -101,10 +102,20 @@ spec:
                       description: Kind is the Kind of the resource to be synchronized.
                       type: string
                     namespaces:
-                      description: Namespaces is an optional list of namespaces to
-                        watch. If not provided, all namespaces are synchronized.
+                      description: |-
+                        Namespaces lists the namespaces whose objects this rule syncs, or is
+                        ["*"] to sync every namespace. "*" cannot be combined with other
+                        namespaces. Cluster-scoped objects are never synced.
+
+                        A KRMSyncer may always list its own namespace. Listing any other
+                        namespace, or "*", is only allowed if the KRMSyncer is in a namespace the
+                        controller trusts (its --trusted-namespaces flag). Otherwise the
+                        KRMSyncer is rejected with an InvalidRule condition and nothing is synced
+                        for it.
                       items:
+                        minLength: 1
                         type: string
+                      minItems: 1
                       type: array
                     syncFields:
                       default:
@@ -126,6 +137,7 @@ spec:
                   required:
                   - group
                   - kind
+                  - namespaces
                   - version
                   type: object
                 type: array

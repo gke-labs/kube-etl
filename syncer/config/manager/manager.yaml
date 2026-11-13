@@ -31,6 +31,16 @@ spec:
         - /manager
         args:
         - --v=2
+        # KRMSyncers in the controller's own namespace may sync other namespaces
+        # (rules with "*" or other namespaces). KRMSyncers elsewhere can only
+        # sync their own namespace. deploy.sh adds the KRMSyncer CR's namespace
+        # if --namespace is set to another namespace.
+        - --trusted-namespaces=$(POD_NAMESPACE)
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         image: controller:latest
         name: manager
         securityContext:

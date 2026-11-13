@@ -95,7 +95,8 @@ Flags:
                          (default: gke_<project>_<dest-location>_<dest-cluster>)
       --project          GCP project of the destination cluster and the controller's
                          Google Service Account (required)
-  -n, --namespace        Namespace for the KRMSyncer CR (default: ${CONTROLLER_NAMESPACE})
+  -n, --namespace        Namespace for the KRMSyncer CR (default: ${CONTROLLER_NAMESPACE}).
+                         The controller is configured to trust it (--trusted-namespaces).
       --sync-mode        What the KRMSyncer CR replicates from KCC resources (default: status):
                          status: only status, plus spec.resourceID for the GVKs in
                                  config/templates/service-generated-resource-id-gvks.yaml
@@ -258,11 +259,12 @@ render_template() {
 }
 
 # print_resource_id_rule prints a KRMSyncer rule that syncs status and
-# spec.resourceID for one GVK. Usage: print_resource_id_rule <file> <group> <version> <kind>
+# spec.resourceID for one GVK in every namespace, like the wildcard rule in
+# config/templates/krmsyncer.yaml. Usage: print_resource_id_rule <file> <group> <version> <kind>
 print_resource_id_rule() {
   [[ -n "$2" && -n "$3" && -n "$4" ]] ||
     die "$1: incomplete entry (group: \"$2\", version: \"$3\", kind: \"$4\")"
-  printf '  - group: %s\n    version: %s\n    kind: %s\n    syncFields: [status, spec.resourceID]\n' "$2" "$3" "$4"
+  printf '  - group: %s\n    version: %s\n    kind: %s\n    namespaces: ["*"]\n    syncFields: [status, spec.resourceID]\n' "$2" "$3" "$4"
 }
 
 # resource_id_rules prints a [status, spec.resourceID] KRMSyncer rule for each
@@ -561,6 +563,16 @@ render_manifests() {
   MANIFESTS="$(kubectl kustomize "${config_dir}")"
   [[ "${MANIFESTS}" == *"image: ${IMAGE_PLACEHOLDER}"* ]] ||
     die "image \"${IMAGE_PLACEHOLDER}\" not found in rendered manifests; check config/manager/manager.yaml"
+  # The KRMSyncer CR's rules use namespaces: ["*"], which the controller only
+  # allows for KRMSyncers in a trusted namespace. Its own namespace is trusted;
+  # trust the CR's namespace too if --namespace selects another one.
+  # shellcheck disable=SC2016 # $(POD_NAMESPACE) is expanded by Kubernetes, not here.
+  local trusted_arg='--trusted-namespaces=$(POD_NAMESPACE)'
+  [[ "${MANIFESTS}" == *"${trusted_arg}"* ]] ||
+    die "\"${trusted_arg}\" not found in rendered manifests; check config/manager/manager.yaml"
+  if [[ "${NAMESPACE}" != "${CONTROLLER_NAMESPACE}" ]]; then
+    MANIFESTS="${MANIFESTS//"${trusted_arg}"/"${trusted_arg},${NAMESPACE}"}"
+  fi
   render_sync_config
 }
 

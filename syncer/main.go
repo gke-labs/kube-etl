@@ -60,6 +60,11 @@ func run(ctx context.Context) error {
 	flag.DurationVar(&syncPeriod, "sync-period", 0, "The minimum frequency at which watched resources are reconciled (0 or negative disables periodic sync)")
 	var maxConcurrentReconciles int
 	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", krmSyncer.DefaultMaxConcurrentReconciles, "Maximum number of concurrent reconciles for dynamic controllers.")
+	var trustedNamespaces []string
+	flag.StringSliceVar(&trustedNamespaces, "trusted-namespaces", nil,
+		"Comma-separated namespaces whose KRMSyncers may sync objects outside their own namespace (rules that list other namespaces, or \"*\" for every namespace). "+
+			"KRMSyncers in other namespaces can only sync their own namespace. \"*\" trusts every namespace. "+
+			"Only cluster administrators should be able to create KRMSyncers in these namespaces.")
 
 	// Configure logging
 	klogFlagSet := goflag.NewFlagSet("klog", goflag.ExitOnError)
@@ -105,6 +110,7 @@ func run(ctx context.Context) error {
 		Manager:                 mgr,
 		SyncPeriod:              syncPeriodOpt,
 		MaxConcurrentReconciles: maxConcurrentReconciles,
+		TrustedNamespaces:       trustedNamespaces,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Syncer")
 		return err
