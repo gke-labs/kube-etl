@@ -19,6 +19,10 @@
 # rule in order with the same SSA field manager, so a status-only apply that
 # runs after a spec.resourceID rule would drop spec.resourceID again.
 #
+# The wildcard rule skips Config Connector's own configuration and state
+# (core.cnrm.cloud.google.com and its subgroups, such as ConfigConnector objects
+# and the MultiClusterLease): each cluster has its own.
+#
 # The controller expands the glob using the source cluster's API discovery;
 # globs are only supported for KCC groups with version and kind both set to
 # "*". The '*' values must be quoted in YAML.

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
@@ -210,4 +211,44 @@ func TestExpandRulePreferredVersionOnly(t *testing.T) {
 		{Group: group, Version: "v1beta1", Kind: "PubSubTopic"},   // preferred version only
 		{Group: group, Version: "v1alpha1", Kind: "PubSubSchema"}, // only served in v1alpha1
 	}, gvks)
+}
+
+// TestKCCGlobSkipsSystemGroups checks that the KCC glob skips Config
+// Connector's own configuration and state (core.cnrm.cloud.google.com and its
+// subgroups, such as the MultiClusterLease), both when it is expanded and when
+// objects are matched, and that rules naming those groups still match them.
+func TestKCCGlobSkipsSystemGroups(t *testing.T) {
+	resource := schema.GroupVersionKind{Group: "compute.cnrm.cloud.google.com", Version: "v1beta1", Kind: "ComputeInstance"}
+	system := []schema.GroupVersionKind{
+		{Group: "core.cnrm.cloud.google.com", Version: "v1beta1", Kind: "ConfigConnectorContext"},
+		{Group: "customize.core.cnrm.cloud.google.com", Version: "v1beta1", Kind: "NamespacedControllerResource"},
+		{Group: "multicluster.core.cnrm.cloud.google.com", Version: "v1alpha1", Kind: "MultiClusterLease"},
+	}
+	var resourceLists []*metav1.APIResourceList
+	for _, gvk := range append([]schema.GroupVersionKind{resource}, system...) {
+		resourceLists = append(resourceLists, &metav1.APIResourceList{
+			GroupVersion: gvk.GroupVersion().String(),
+			APIResources: []metav1.APIResource{{Name: strings.ToLower(gvk.Kind) + "s", Kind: gvk.Kind, Namespaced: true}},
+		})
+	}
+	r := &KRMSyncerReconciler{}
+	dr := &DynamicResourceReconciler{}
+	glob := krmv1alpha1.ResourceRule{Group: "*.cnrm.cloud.google.com", Version: "*", Kind: "*"}
+
+	gvks, err := r.expandRule(t.Context(), nil, glob, krmv1alpha1.ModePull, resourceLists)
+	require.NoError(t, err)
+	assert.Equal(t, []schema.GroupVersionKind{resource}, gvks)
+	assert.True(t, dr.ruleMatchesGVK(glob, resource))
+
+	for _, gvk := range system {
+		t.Run(gvk.Kind, func(t *testing.T) {
+			assert.False(t, dr.ruleMatchesGVK(glob, gvk), "the KCC glob should not match %s", gvk)
+
+			named := krmv1alpha1.ResourceRule{Group: gvk.Group, Version: "*", Kind: "*"}
+			gvks, err := r.expandRule(t.Context(), nil, named, krmv1alpha1.ModePull, resourceLists)
+			require.NoError(t, err)
+			assert.Equal(t, []schema.GroupVersionKind{gvk}, gvks, "a rule naming %s should still expand to it", gvk.Group)
+			assert.True(t, dr.ruleMatchesGVK(named, gvk))
+		})
+	}
 }

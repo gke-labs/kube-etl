@@ -50,6 +50,8 @@ spec:
       endpoint: Default # Optional. Default | DNS | PrivateIP
 ```
 
+A rule with `group: "*.cnrm.cloud.google.com"`, `version: "*"` and `kind: "*"` syncs every Config Connector resource kind the source cluster serves. It skips Config Connector's own configuration and state, `core.cnrm.cloud.google.com` and its subgroups (such as `ConfigConnector` objects, controller customizations and the `MultiClusterLease`), since each cluster has its own. Globs are only supported in this form, or with a single KCC group instead of `*.cnrm.cloud.google.com`.
+
 `spec.remote.gkeCluster.endpoint` selects how the controller reaches the remote cluster:
 - `Default` (default): the cluster's default endpoint, the same one `gcloud container clusters get-credentials` uses.
 - `DNS`: the cluster's DNS-based endpoint. It must be enabled for external traffic (`gcloud container clusters update --enable-dns-access`); needs no VPC connectivity, and is unaffected by credential rotation.
