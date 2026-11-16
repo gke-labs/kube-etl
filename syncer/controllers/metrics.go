@@ -15,11 +15,8 @@
 package controllers
 
 import (
-	"sync"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -52,47 +49,4 @@ func init() {
 
 func failedObjectsGauge(gvk schema.GroupVersionKind) prometheus.Gauge {
 	return FailedObjects.WithLabelValues(gvk.Group, gvk.Version, gvk.Kind)
-}
-
-// failureTracker tracks which objects are currently failing and keeps a gauge equal
-// to their number: an object is added on a failed attempt and removed on success, so
-// repeated failures of the same object count once.
-//
-// A nil *failureTracker ignores all updates.
-type failureTracker struct {
-	gauge prometheus.Gauge
-
-	mu     sync.Mutex
-	failed map[types.NamespacedName]struct{}
-}
-
-func newFailureTracker(gauge prometheus.Gauge) *failureTracker {
-	return &failureTracker{gauge: gauge, failed: make(map[types.NamespacedName]struct{})}
-}
-
-// markFailed records that the latest attempt for key failed.
-func (t *failureTracker) markFailed(key types.NamespacedName) {
-	if t == nil {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if _, ok := t.failed[key]; !ok {
-		t.failed[key] = struct{}{}
-		t.gauge.Inc()
-	}
-}
-
-// markSucceeded records that the latest attempt for key succeeded, or that key no
-// longer needs syncing (e.g. it was deleted).
-func (t *failureTracker) markSucceeded(key types.NamespacedName) {
-	if t == nil {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if _, ok := t.failed[key]; ok {
-		delete(t.failed, key)
-		t.gauge.Dec()
-	}
 }

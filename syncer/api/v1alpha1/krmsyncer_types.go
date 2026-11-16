@@ -115,10 +115,45 @@ type KRMSyncerSpec struct {
 	Rules []ResourceRule `json:"rules"`
 }
 
+// ConditionReady is the condition type reporting whether a KRMSyncer is
+// syncing. It is written at the end of every reconcile.
+const ConditionReady = "Ready"
+
+// Reasons of the Ready condition.
+const (
+	// ReasonSyncing (Ready=True): setup succeeded, the remote cluster is
+	// reachable and no object is failing to sync.
+	ReasonSyncing = "Syncing"
+	// ReasonSuspended (Ready=False): spec.suspend is set.
+	ReasonSuspended = "Suspended"
+	// ReasonRemoteUnreachable (Ready=False): the latest requests to the remote
+	// cluster failed (network error, 401, 403 or 5xx).
+	ReasonRemoteUnreachable = "RemoteUnreachable"
+	// ReasonSetupFailed (Ready=False): the latest setup attempt (API
+	// discovery, rule expansion, connecting to the remote cluster, starting
+	// watches) failed. It is retried with backoff.
+	ReasonSetupFailed = "SetupFailed"
+	// ReasonSyncFailed (Ready=False): the latest sync attempt of some objects
+	// failed (see status.failedObjects). They are retried with backoff.
+	ReasonSyncFailed = "SyncFailed"
+)
+
 // KRMSyncerStatus defines the observed state.
 // +kubebuilder:object:generate=true
 type KRMSyncerStatus struct {
-	// Conditions of the Syncer.
+	// ObservedGeneration is the generation of the spec that the status
+	// reflects.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// FailedObjects is the number of objects whose latest sync attempt for
+	// this KRMSyncer failed. An object is counted from its first failed
+	// attempt until it syncs successfully.
+	// +optional
+	FailedObjects int32 `json:"failedObjects,omitempty"`
+
+	// Conditions of the Syncer. The Ready condition reports whether the
+	// syncer is syncing.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }

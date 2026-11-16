@@ -15,7 +15,9 @@
 package controllers
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -311,3 +313,73 @@ func TestGKEClusterEndpoints(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestHealthTransport(t *testing.T) {
+	// The next response of the base transport: a status code, or an error.
+	var nextCode int
+	var nextErr error
+	base := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if nextErr != nil {
+			return nil, nextErr
+		}
+		return &http.Response{StatusCode: nextCode, Body: http.NoBody, Request: req}, nil
+	})
+	var notifications int
+	h := &remoteHealth{onChange: func() { notifications++ }}
+	rt := h.wrap(base)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for _, step := range []struct {
+		name string
+		code int
+		err  error
+		ctx  context.Context
+		// wantErr is the expected unreachable error ("" if reachable).
+		wantErr           string
+		wantNotifications int
+	}{
+		{name: "2xx while reachable", code: 200, wantNotifications: 0},
+		{name: "401", code: 401, wantErr: "Unauthorized", wantNotifications: 1},
+		{name: "401 again", code: 401, wantErr: "Unauthorized", wantNotifications: 1},
+		{name: "403 updates the error", code: 403, wantErr: "Forbidden", wantNotifications: 1},
+		{name: "404 is ignored", code: 404, wantErr: "Forbidden", wantNotifications: 1},
+		{name: "409 is ignored", code: 409, wantErr: "Forbidden", wantNotifications: 1},
+		{name: "201", code: 201, wantNotifications: 2},
+		{name: "204", code: 204, wantNotifications: 2},
+		{name: "500", code: 500, wantErr: "Internal Server Error", wantNotifications: 3},
+		{name: "200", code: 200, wantNotifications: 4},
+		{name: "503", code: 503, wantErr: "Service Unavailable", wantNotifications: 5},
+		{name: "unknown 5xx", code: 599, wantErr: "HTTP status 599", wantNotifications: 5},
+		{name: "200 again", code: 200, wantNotifications: 6},
+		{name: "network error", err: errors.New("connection refused"), wantErr: "connection refused", wantNotifications: 7},
+		{name: "200 after network error", code: 200, wantNotifications: 8},
+		{name: "cancelled request is ignored", err: context.Canceled, ctx: cancelled, wantNotifications: 8},
+		{name: "wrapped cancellation is ignored", err: fmt.Errorf("watch: %w", context.Canceled), wantNotifications: 8},
+		{name: "deadline exceeded", err: context.DeadlineExceeded, wantErr: "context deadline exceeded", wantNotifications: 9},
+		{name: "429 is ignored", code: 429, wantErr: "context deadline exceeded", wantNotifications: 9},
+	} {
+		nextCode, nextErr = step.code, step.err
+		ctx := step.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://remote/api", nil)
+		require.NoError(t, err)
+		resp, err := rt.RoundTrip(req)
+		if step.err != nil {
+			assert.ErrorIs(t, err, step.err, step.name)
+		} else {
+			require.NoError(t, err, step.name)
+			assert.Equal(t, step.code, resp.StatusCode, "%s: the response is passed through", step.name)
+		}
+
+		if step.wantErr == "" {
+			assert.NoError(t, h.unreachable(), step.name)
+		} else {
+			assert.EqualError(t, h.unreachable(), step.wantErr, step.name)
+		}
+		assert.Equal(t, step.wantNotifications, notifications, "%s: notifications", step.name)
+	}
+}

@@ -24,7 +24,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"io"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -247,6 +249,62 @@ func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Clie
 			assert.True(t, errors.IsNotFound(err), "Resource %s should NOT exist in Destination Cluster", key)
 		}
 	}
+
+	// Verify the KRMSyncer status, if the case provides syncer-status.yaml.
+	statusPath := filepath.Join(caseDir, "syncer-status.yaml")
+	if _, err := os.Stat(statusPath); err == nil {
+		verifySyncerStatus(t, ctx, clientA, syncer, statusPath)
+	}
+}
+
+// verifySyncerStatus waits until the status of syncer matches the expected
+// status in path: failedObjects, and the type, status, reason and (if set)
+// message of each expected condition. observedGeneration must match the
+// KRMSyncer generation.
+func verifySyncerStatus(t *testing.T, ctx context.Context, c client.Client, syncer *krmv1alpha1.KRMSyncer, path string) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	want := krmv1alpha1.KRMSyncerStatus{}
+	require.NoError(t, yaml.Unmarshal(b, &want))
+
+	t.Logf("Verifying KRMSyncer status...")
+	var mismatch string
+	err = wait.PollUntilContextTimeout(ctx, 200*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		got := &krmv1alpha1.KRMSyncer{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(syncer), got); err != nil {
+			mismatch = err.Error()
+			return false, nil
+		}
+		mismatch = syncerStatusMismatch(want, got)
+		return mismatch == "", nil
+	})
+	require.NoError(t, err, "KRMSyncer status mismatch: %s", mismatch)
+}
+
+// syncerStatusMismatch describes how the status of got differs from want, or
+// returns "" if it matches.
+func syncerStatusMismatch(want krmv1alpha1.KRMSyncerStatus, got *krmv1alpha1.KRMSyncer) string {
+	if got.Status.ObservedGeneration != got.Generation {
+		return fmt.Sprintf("observedGeneration is %d, want %d", got.Status.ObservedGeneration, got.Generation)
+	}
+	if got.Status.FailedObjects != want.FailedObjects {
+		return fmt.Sprintf("failedObjects is %d, want %d", got.Status.FailedObjects, want.FailedObjects)
+	}
+	for _, w := range want.Conditions {
+		g := meta.FindStatusCondition(got.Status.Conditions, w.Type)
+		switch {
+		case g == nil:
+			return fmt.Sprintf("condition %s is not set", w.Type)
+		case g.Status != w.Status || g.Reason != w.Reason:
+			return fmt.Sprintf("condition %s is %s/%s (%q), want %s/%s", w.Type, g.Status, g.Reason, g.Message, w.Status, w.Reason)
+		case w.Message != "" && g.Message != w.Message:
+			return fmt.Sprintf("condition %s message is %q, want %q", w.Type, g.Message, w.Message)
+		case g.ObservedGeneration != got.Generation:
+			return fmt.Sprintf("condition %s observedGeneration is %d, want %d", w.Type, g.ObservedGeneration, got.Generation)
+		}
+	}
+	return ""
 }
 
 // isStatusMode reports whether no rule of the syncer syncs the full spec, i.e.

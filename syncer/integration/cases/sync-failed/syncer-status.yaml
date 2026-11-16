@@ -1,0 +1,8 @@
+# Expected KRMSyncer status: the TestCRD fails to sync (its destination object
+# does not exist).
+failedObjects: 1
+conditions:
+- type: Ready
+  status: "False"
+  reason: SyncFailed
+  message: "1 destination object missing. See the controller logs for details."

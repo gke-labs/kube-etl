@@ -335,3 +335,93 @@ func googleAPIErrorMessage(body []byte) string {
 	}
 	return msg
 }
+
+// remoteHealth tracks whether a remote cluster is reachable, based on the
+// responses to the requests sent to it through healthTransport. A remote is
+// reachable until a request fails.
+type remoteHealth struct {
+	// onChange is called, without holding mu, when reachability changes.
+	// May be nil.
+	onChange func()
+
+	mu  sync.Mutex
+	err error // why the remote is unreachable; nil if reachable
+}
+
+// markUnreachable records that the remote is unreachable because of err.
+func (h *remoteHealth) markUnreachable(err error) {
+	h.mu.Lock()
+	changed := h.err == nil
+	h.err = err // keep the latest error for the status message
+	h.mu.Unlock()
+	if changed && h.onChange != nil {
+		h.onChange()
+	}
+}
+
+// markReachable records that the remote is reachable.
+func (h *remoteHealth) markReachable() {
+	h.mu.Lock()
+	changed := h.err != nil
+	h.err = nil
+	h.mu.Unlock()
+	if changed && h.onChange != nil {
+		h.onChange()
+	}
+}
+
+// unreachable returns why the remote is unreachable, or nil if it is reachable.
+func (h *remoteHealth) unreachable() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.err
+}
+
+// wrap wraps rt (e.g. a rest.Config transport) to update h from each response.
+func (h *remoteHealth) wrap(rt http.RoundTripper) http.RoundTripper {
+	return &healthTransport{base: rt, health: h}
+}
+
+// healthTransport reports the outcome of each request to a remote cluster to
+// a remoteHealth:
+//   - a network error, 401, 403 or 5xx marks the remote unreachable;
+//   - a 2xx marks it reachable;
+//   - other responses (e.g. 404, 409) and requests cancelled by the caller
+//     (e.g. a stopped watch) say nothing about reachability and are ignored.
+//
+// remoteHealth only notifies when reachability changes, so requests to a
+// healthy remote cost a mutex and a comparison.
+type healthTransport struct {
+	base   http.RoundTripper
+	health *remoteHealth
+}
+
+var _ http.RoundTripper = &healthTransport{}
+
+func (t *healthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	switch {
+	case err != nil:
+		if errors.Is(err, context.Canceled) || errors.Is(req.Context().Err(), context.Canceled) {
+			break
+		}
+		t.health.markUnreachable(err)
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		t.health.markReachable()
+	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden, resp.StatusCode >= 500:
+		t.health.markUnreachable(errors.New(statusText(resp.StatusCode)))
+	}
+	return resp, err
+}
+
+// WrappedRoundTripper lets client-go reach the underlying transport (e.g. to
+// close idle connections).
+func (t *healthTransport) WrappedRoundTripper() http.RoundTripper { return t.base }
+
+// statusText returns the text of an HTTP status code, e.g. "Unauthorized".
+func statusText(code int) string {
+	if s := http.StatusText(code); s != "" {
+		return s
+	}
+	return fmt.Sprintf("HTTP status %d", code)
+}
