@@ -25,6 +25,7 @@ import (
 	"io"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
@@ -36,6 +37,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"slices"
 	"testing"
@@ -124,6 +126,146 @@ func TestKRMSyncerIntegration(t *testing.T) {
 			runTestCase(t, ctx, k8sClientA, k8sClientB, filepath.Join(casesDir, caseName))
 		})
 	}
+
+	// This manager uses the default resync period (about 10h), so these tests
+	// rely on the KRMSyncer event filter alone.
+	t.Run("spec-change-without-resync", func(t *testing.T) {
+		testSpecChangeWithoutResync(t, ctx, k8sClientA)
+	})
+	t.Run("status-writes-do-not-rerun-setup", func(t *testing.T) {
+		testStatusWritesDoNotRerunSetup(t, ctx, k8sClientA)
+	})
+}
+
+// testSpecChangeWithoutResync verifies that a spec change (suspend) is set up
+// and reported right away, without waiting for a periodic resync.
+func testSpecChangeWithoutResync(t *testing.T, ctx context.Context, c client.Client) {
+	syncer := newTestSyncer("spec-change-syncer", "spec")
+	require.NoError(t, c.Create(ctx, syncer))
+	defer func() { _ = c.Delete(ctx, syncer) }()
+	waitForReady(t, ctx, c, syncer, "True", krmv1alpha1.ReasonSyncing, 1)
+
+	setSuspend := func(suspend bool) {
+		t.Helper()
+		require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(syncer), syncer))
+		syncer.Spec.Suspend = suspend
+		require.NoError(t, c.Update(ctx, syncer))
+	}
+	setSuspend(true)
+	waitForReady(t, ctx, c, syncer, "True", krmv1alpha1.ReasonSuspended, 2)
+	setSuspend(false)
+	waitForReady(t, ctx, c, syncer, "True", krmv1alpha1.ReasonSyncing, 3)
+}
+
+// testStatusWritesDoNotRerunSetup verifies that status writes (here, as
+// objects start failing) do not trigger KRMSyncer reconciles.
+func testStatusWritesDoNotRerunSetup(t *testing.T, ctx context.Context, c client.Client) {
+	// Status mode, and no destination objects: every TestCRD fails to sync.
+	syncer := newTestSyncer("status-writes-syncer", "status")
+	require.NoError(t, c.Create(ctx, syncer))
+	defer func() { _ = c.Delete(ctx, syncer) }()
+	waitForReady(t, ctx, c, syncer, "True", krmv1alpha1.ReasonSyncing, 1)
+
+	// Wait for KRMSyncer reconciles (e.g. retries of earlier cases) to settle.
+	reconciles := krmSyncerReconciles(t)
+	settled := time.Now()
+	for time.Since(settled) < 5*time.Second {
+		time.Sleep(500 * time.Millisecond)
+		if n := krmSyncerReconciles(t); n != reconciles {
+			reconciles, settled = n, time.Now()
+		}
+	}
+
+	// Each new failing object changes status.failedObjects: a status write.
+	var objs []*unstructured.Unstructured
+	defer func() {
+		for _, obj := range objs {
+			_ = c.Delete(ctx, obj)
+		}
+	}()
+	for i := 1; i <= 3; i++ {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "e2e.gkelabs.io/v1alpha1",
+			"kind":       "TestCRD",
+			"metadata":   map[string]any{"name": fmt.Sprintf("status-writes-%d", i), "namespace": "default"},
+			"spec":       map[string]any{"foo": "bar"},
+		}}
+		require.NoError(t, c.Create(ctx, obj))
+		objs = append(objs, obj)
+		waitForFailedObjects(t, ctx, c, syncer, int32(i))
+	}
+	assert.Equal(t, reconciles, krmSyncerReconciles(t), "status writes must not trigger KRMSyncer reconciles")
+}
+
+// newTestSyncer returns a Push mode KRMSyncer of TestCRDs to cluster B.
+func newTestSyncer(name, syncField string) *krmv1alpha1.KRMSyncer {
+	return &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode: krmv1alpha1.ModePush,
+			Remote: &krmv1alpha1.RemoteConfig{GKECluster: &krmv1alpha1.GKECluster{
+				Project: "test-project", Location: "us-central1", Name: "cluster-b",
+			}},
+			Rules: []krmv1alpha1.ResourceRule{{
+				Group: "e2e.gkelabs.io", Version: "v1alpha1", Kind: "TestCRD", SyncFields: []string{syncField},
+			}},
+		},
+	}
+}
+
+// waitForReady waits (at most 10s, much less than a resync) until syncer is
+// Ready with status and reason, for generation.
+func waitForReady(t *testing.T, ctx context.Context, c client.Client, syncer *krmv1alpha1.KRMSyncer, status metav1.ConditionStatus, reason string, generation int64) {
+	t.Helper()
+	var last krmv1alpha1.KRMSyncerStatus
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		got := &krmv1alpha1.KRMSyncer{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(syncer), got); err != nil {
+			return false, nil
+		}
+		last = got.Status
+		ready := meta.FindStatusCondition(got.Status.Conditions, krmv1alpha1.ConditionReady)
+		return got.Generation == generation && got.Status.ObservedGeneration == generation &&
+			ready != nil && ready.Status == status && ready.Reason == reason, nil
+	})
+	require.NoError(t, err, "want Ready=%s/%s at generation %d, last status: %+v", status, reason, generation, last)
+}
+
+// waitForFailedObjects waits until syncer reports want failed objects.
+func waitForFailedObjects(t *testing.T, ctx context.Context, c client.Client, syncer *krmv1alpha1.KRMSyncer, want int32) {
+	t.Helper()
+	var last int32
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		got := &krmv1alpha1.KRMSyncer{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(syncer), got); err != nil {
+			return false, nil
+		}
+		last = got.Status.FailedObjects
+		return last == want, nil
+	})
+	require.NoError(t, err, "want failedObjects=%d, last: %d", want, last)
+}
+
+// krmSyncerReconciles returns the number of KRMSyncer reconciles so far
+// (controller_runtime_reconcile_total for the krmsyncer controller).
+func krmSyncerReconciles(t *testing.T) float64 {
+	t.Helper()
+	families, err := metrics.Registry.Gather()
+	require.NoError(t, err)
+	var total float64
+	for _, family := range families {
+		if family.GetName() != "controller_runtime_reconcile_total" {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			for _, label := range m.GetLabel() {
+				if label.GetName() == "controller" && label.GetValue() == "krmsyncer" {
+					total += m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return total
 }
 
 func runTestCase(t *testing.T, ctx context.Context, clientA, clientB client.Client, caseDir string) {

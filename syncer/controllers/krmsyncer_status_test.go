@@ -20,10 +20,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/prometheus/client_golang/prometheus"
@@ -496,4 +498,92 @@ func TestReadyRemoteKindFailures(t *testing.T) {
 	h.markUnreachable(stderrors.New("Unauthorized"))
 	cond = ready(both...)
 	assert.Equal(t, krmv1alpha1.ReasonRemoteUnreachable, cond.Reason)
+}
+
+// TestUpdateAllStatus verifies that the periodic status update writes status
+// once per change, however many objects change, and never when nothing
+// changed.
+func TestUpdateAllStatus(t *testing.T) {
+	newSyncer := func(name string, generation int64) *krmv1alpha1.KRMSyncer {
+		return &krmv1alpha1.KRMSyncer{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Generation: generation},
+			Spec:       krmv1alpha1.KRMSyncerSpec{Mode: krmv1alpha1.ModePush, Remote: testRemote(destClusterName)},
+		}
+	}
+	ready := newSyncer("ready", 1)
+	longError := newSyncer("long-error", 1)
+	notSetUp := newSyncer("not-set-up", 2)
+
+	var mu sync.Mutex
+	patches := map[string]int{}
+	countPatches := func(name string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return patches[name]
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme.Scheme).
+		WithObjects(ready, longError, notSetUp).
+		WithStatusSubresource(&krmv1alpha1.KRMSyncer{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				mu.Lock()
+				patches[obj.GetName()]++
+				mu.Unlock()
+				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			},
+		}).Build()
+	const interval = 10 * time.Millisecond
+	r := &KRMSyncerReconciler{
+		Client:               c,
+		Scheme:               scheme.Scheme,
+		RemoteConfigProvider: testRemoteProvider,
+		setupFailures:        newSetupFailureTracker(prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_setup_failed"})),
+		syncFailures:         newSyncFailureTracker(nil),
+		statusInterval:       interval,
+	}
+	r.setupFailures.record(client.ObjectKeyFromObject(ready), 1, nil)
+	// A setup error longer than maxConditionMessageLen, with a multi-byte
+	// character across the cut.
+	longMessage := strings.Repeat("a", maxConditionMessageLen-1) + "é" + strings.Repeat("b", 10)
+	r.setupFailures.record(client.ObjectKeyFromObject(longError), 1, stderrors.New(longMessage))
+	// Only an older generation has been set up.
+	r.setupFailures.record(client.ObjectKeyFromObject(notSetUp), 1, nil)
+
+	// run runs the periodic update for a number of intervals, then stops it.
+	run := func(intervals int) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error)
+		go func() { done <- r.updateAllStatus(ctx) }()
+		time.Sleep(time.Duration(intervals) * interval)
+		cancel()
+		require.NoError(t, <-done)
+	}
+
+	// The first updates write the initial status; later ones, with nothing
+	// changed, write nothing (including the truncated long message).
+	run(20)
+	assert.Equal(t, 1, countPatches("ready"))
+	assert.Equal(t, 1, countPatches("long-error"), "a truncated message must compare equal once written")
+	assert.Equal(t, 0, countPatches("not-set-up"), "no status until the current generation is set up")
+	got := &krmv1alpha1.KRMSyncer{}
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(longError), got))
+	msg := meta.FindStatusCondition(got.Status.Conditions, krmv1alpha1.ConditionReady).Message
+	assert.True(t, utf8.ValidString(msg), "the truncated message must be valid UTF-8")
+	assert.Equal(t, strings.Repeat("a", maxConditionMessageLen-1)+"...", msg)
+
+	// 50 objects start failing at once: one status write.
+	for i := range 50 {
+		obj := objectRef{GVK: schema.GroupVersionKind{Version: "v1", Kind: "Service"}, Key: types.NamespacedName{Namespace: "ns", Name: fmt.Sprintf("svc-%d", i)}}
+		r.syncFailures.markFailed(client.ObjectKeyFromObject(ready), obj, "apply failed (Forbidden)")
+	}
+	run(20)
+	assert.Equal(t, 2, countPatches("ready"), "50 failures cost one status write")
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(ready), got))
+	assert.Equal(t, int32(50), got.Status.FailedObjects)
+	assert.Equal(t, 1, countPatches("long-error"))
+	assert.Equal(t, 0, countPatches("not-set-up"))
+
+	// A KRMSyncer deleted between the List and its update is not an error.
+	assert.NoError(t, r.updateStatus(t.Context(), types.NamespacedName{Namespace: "default", Name: "deleted"}))
 }

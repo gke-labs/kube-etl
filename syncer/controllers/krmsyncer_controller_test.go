@@ -48,6 +48,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -55,6 +56,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
@@ -1498,4 +1500,127 @@ func TestSyncErrorCategory(t *testing.T) {
 	}
 	// The error message is unchanged.
 	assert.Equal(t, "missing", newSyncError("destination object missing", stderrors.New("missing")).Error())
+}
+
+// TestKRMSyncerEventFilter verifies which KRMSyncer events run setup. The test
+// manager resyncs every 2s, which would hide a broken filter in the end-to-end
+// tests.
+func TestKRMSyncerEventFilter(t *testing.T) {
+	syncer := func(generation int64, resourceVersion string) *krmv1alpha1.KRMSyncer {
+		return &krmv1alpha1.KRMSyncer{ObjectMeta: metav1.ObjectMeta{
+			Name: "syncer", Namespace: "default", Generation: generation, ResourceVersion: resourceVersion,
+		}}
+	}
+	withStatus := syncer(1, "11")
+	withStatus.Status.FailedObjects = 3
+	withLabels := syncer(1, "11")
+	withLabels.Labels = map[string]string{"team": "a"}
+	withLabels.Annotations = map[string]string{"note": "b"}
+
+	p := krmSyncerEventFilter()
+	assert.True(t, p.Create(event.CreateEvent{Object: syncer(1, "10")}), "create")
+	assert.True(t, p.Delete(event.DeleteEvent{Object: syncer(1, "10")}), "delete (Reconcile clears the trackers)")
+	for _, tc := range []struct {
+		name     string
+		old, new *krmv1alpha1.KRMSyncer
+		want     bool
+	}{
+		{name: "spec change (new generation)", old: syncer(1, "10"), new: syncer(2, "11"), want: true},
+		{name: "status only (e.g. our own status write)", old: syncer(1, "10"), new: withStatus, want: false},
+		{name: "labels and annotations only", old: syncer(1, "10"), new: withLabels, want: false},
+		{name: "periodic resync (unchanged object)", old: syncer(1, "10"), new: syncer(1, "10"), want: true},
+	} {
+		assert.Equal(t, tc.want, p.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.new}), tc.name)
+	}
+}
+
+// TestGlobResyncPicksUpNewCRDs verifies that a periodic resync re-runs setup,
+// so a glob rule starts syncing a CRD installed after the KRMSyncer, without a
+// spec change.
+func TestGlobResyncPicksUpNewCRDs(t *testing.T) {
+	ctx := t.Context()
+	suffix := utilrand.String(5)
+	ns := "glob-resync-" + suffix
+	group := "resync" + suffix + ".cnrm.cloud.google.com"
+	require.NoError(t, k8sClientSource.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}))
+
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: "glob-syncer", Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destClusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{Group: "*.cnrm.cloud.google.com", Version: "*", Kind: "*", Namespaces: []string{ns}, SyncFields: []string{"spec"}},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+	waitForReadyCondition(ctx, t, syncer, metav1.ConditionTrue, krmv1alpha1.ReasonSyncing, "")
+
+	// Install a new KCC CRD on both clusters, after the KRMSyncer was set up.
+	for _, c := range []client.Client{k8sClientSource, k8sClientDest} {
+		installWidgetCRD(ctx, t, c, group)
+	}
+
+	widget := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": group + "/v1",
+		"kind":       "Widget",
+		"metadata":   map[string]any{"name": "widget", "namespace": ns},
+		"spec":       map[string]any{"foo": "bar"},
+	}}
+	err := wait.PollUntilContextTimeout(ctx, 200*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		return k8sClientSource.Create(ctx, widget.DeepCopy()) == nil, nil
+	})
+	require.NoError(t, err, "Widget should be created once the CRD is served")
+
+	// The next resync re-runs setup, which discovers the new kind and syncs it.
+	err = wait.PollUntilContextTimeout(ctx, 200*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(widget.GroupVersionKind())
+		if err := k8sClientDest.Get(ctx, client.ObjectKeyFromObject(widget), got); err != nil {
+			return false, nil
+		}
+		foo, _, _ := unstructured.NestedString(got.Object, "spec", "foo")
+		return foo == "bar", nil
+	})
+	require.NoError(t, err, "the Widget should be pushed after a resync, with no spec change")
+}
+
+// installWidgetCRD installs a namespaced Widget CRD in group and waits until
+// it is established.
+func installWidgetCRD(ctx context.Context, t *testing.T, c client.Client, group string) {
+	t.Helper()
+	crd := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"metadata":   map[string]any{"name": "widgets." + group},
+		"spec": map[string]any{
+			"group": group,
+			"scope": "Namespaced",
+			"names": map[string]any{"kind": "Widget", "listKind": "WidgetList", "plural": "widgets", "singular": "widget"},
+			"versions": []any{map[string]any{
+				"name": "v1", "served": true, "storage": true,
+				"schema": map[string]any{"openAPIV3Schema": map[string]any{
+					"type": "object", "x-kubernetes-preserve-unknown-fields": true,
+				}},
+			}},
+		},
+	}}
+	require.NoError(t, c.Create(ctx, crd))
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(crd.GroupVersionKind())
+		if err := c.Get(ctx, client.ObjectKeyFromObject(crd), got); err != nil {
+			return false, nil
+		}
+		conditions, _, _ := unstructured.NestedSlice(got.Object, "status", "conditions")
+		for _, cond := range conditions {
+			if m, ok := cond.(map[string]any); ok && m["type"] == "Established" && m["status"] == "True" {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	require.NoError(t, err, "CRD %s should be established", crd.GetName())
 }

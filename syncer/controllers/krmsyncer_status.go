@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/prometheus/client_golang/prometheus"
@@ -69,7 +70,11 @@ const statusUpdateInterval = 2 * time.Second
 // server is only called when its status changes, at most once per interval
 // however many objects start or stop failing.
 func (r *KRMSyncerReconciler) updateAllStatus(ctx context.Context) error {
-	ticker := time.NewTicker(statusUpdateInterval)
+	interval := r.statusInterval
+	if interval <= 0 {
+		interval = statusUpdateInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -150,14 +155,27 @@ func (r *KRMSyncerReconciler) setReadyCondition(krmsyncer *krmv1alpha1.KRMSyncer
 		cond.Reason = krmv1alpha1.ReasonSyncing
 		cond.Message = "Syncing resources"
 	}
-	if len(cond.Message) > maxConditionMessageLen {
-		cond.Message = cond.Message[:maxConditionMessageLen] + "..."
-	}
+	cond.Message = truncateMessage(cond.Message, maxConditionMessageLen)
 	for _, t := range legacyConditionTypes {
 		meta.RemoveStatusCondition(&krmsyncer.Status.Conditions, t)
 	}
 	meta.SetStatusCondition(&krmsyncer.Status.Conditions, cond)
 	krmsyncer.Status.ObservedGeneration = krmsyncer.Generation
+}
+
+// truncateMessage shortens msg to at most max bytes (plus "..."), cutting on a
+// character boundary. Cutting inside a multi-byte character would produce
+// invalid UTF-8, which the API server stores differently, so the status would
+// never compare equal and would be rewritten on every update.
+func truncateMessage(msg string, max int) string {
+	if len(msg) <= max {
+		return msg
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + "..."
 }
 
 // failuresMessage describes failures grouped by error, each with the kinds it

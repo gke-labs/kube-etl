@@ -89,6 +89,9 @@ type KRMSyncerReconciler struct {
 	// syncFailures tracks the failed objects of each KRMSyncer, reported in
 	// status.failedObjects and syncer_failed_objects.
 	syncFailures *syncFailureTracker
+	// statusInterval is how often the status of every KRMSyncer is
+	// recomputed. Defaults to statusUpdateInterval.
+	statusInterval time.Duration
 }
 
 type RemoteGVK struct {
@@ -433,14 +436,19 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 	return ctrl.NewControllerManagedBy(mgr).
-		// Set up when the spec changes or on periodic resyncs (e.g. to pick up
-		// new CRDs for glob rules), but not for status-only updates such as
-		// our own status writes.
-		For(&krmv1alpha1.KRMSyncer{}, builder.WithPredicates(predicate.Or(
-			predicate.GenerationChangedPredicate{},
-			resyncPredicate(),
-		))).
+		For(&krmv1alpha1.KRMSyncer{}, builder.WithPredicates(krmSyncerEventFilter())).
 		Complete(r)
+}
+
+// krmSyncerEventFilter selects the KRMSyncer events that need setup: creates,
+// deletes (to clear the trackers), spec changes (generation changes), and
+// periodic resyncs (e.g. to pick up new CRDs for glob rules). It drops
+// status-only and metadata-only updates, such as our own status writes.
+func krmSyncerEventFilter() predicate.Predicate {
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		resyncPredicate(),
+	)
 }
 
 // resyncPredicate passes periodic resync events, which are updates where the

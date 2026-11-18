@@ -329,7 +329,7 @@ func TestHealthTransport(t *testing.T) {
 	h := &remoteHealth{}
 	rt := h.wrap(base)
 
-	cancelled, cancel := context.WithCancel(context.Background())
+	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	const (
@@ -377,7 +377,7 @@ func TestHealthTransport(t *testing.T) {
 		nextCode, nextErr = step.code, step.err
 		ctx := step.ctx
 		if ctx == nil {
-			ctx = context.Background()
+			ctx = t.Context()
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://remote"+step.path, nil)
 		require.NoError(t, err)
