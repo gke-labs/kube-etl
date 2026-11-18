@@ -82,8 +82,9 @@ type KRMSyncerReconciler struct {
 	MaxConcurrentReconciles int
 	mu                      sync.RWMutex
 
-	// remotes tracks the reachability of each remote cluster, reported in
-	// status (Ready=RemoteUnreachable).
+	// remotes tracks the reachability of each remote cluster, from the
+	// requests of Pull mode caches and Push mode clients, reported in status
+	// (Ready=RemoteUnreachable).
 	remotes *remoteHealthTracker
 	// syncFailures tracks the failed objects of each KRMSyncer, reported in
 	// status.failedObjects and syncer_failed_objects.
@@ -386,7 +387,8 @@ func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, key,
 	if err != nil {
 		return nil, err
 	}
-	restConfig.Wrap(r.remotes.get(key).wrap)
+	health := r.remotes.get(key)
+	restConfig.Wrap(health.wrap)
 
 	c, err := cluster.New(restConfig, func(o *cluster.Options) {
 		o.Scheme = r.Scheme
@@ -397,6 +399,8 @@ func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, key,
 	if err != nil {
 		return nil, err
 	}
+	// Map resources refused by the remote (403/5xx) to kinds, for status.
+	health.setMapper(c.GetRESTMapper())
 
 	go func() {
 		if err := c.Start(ctx); err != nil {
@@ -420,9 +424,9 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.WatchedGVKs = make(map[schema.GroupVersionKind]bool)
 	r.WatchedRemoteGVKs = make(map[RemoteGVK]bool)
 	r.RemoteClusters = make(map[string]cluster.Cluster)
-	r.remoteClients = newRemoteClientCache(r.RemoteConfigProvider)
 	r.setupFailures = newSetupFailureTracker(SetupFailed)
 	r.remotes = newRemoteHealthTracker()
+	r.remoteClients = newRemoteClientCache(r.RemoteConfigProvider, r.remotes)
 	r.syncFailures = newSyncFailureTracker(failedObjectsGauge)
 	// Report changes of the trackers in status.
 	if err := mgr.Add(manager.RunnableFunc(r.updateAllStatus)); err != nil {
@@ -469,6 +473,11 @@ type DynamicResourceReconciler struct {
 }
 
 func (r *DynamicResourceReconciler) ruleMatchesGVK(rule krmv1alpha1.ResourceRule, gvk schema.GroupVersionKind) bool {
+	return ruleMatchesGVK(rule, gvk)
+}
+
+// ruleMatchesGVK reports whether rule syncs gvk.
+func ruleMatchesGVK(rule krmv1alpha1.ResourceRule, gvk schema.GroupVersionKind) bool {
 	isKCCGlob := (rule.Group == "*.cnrm.cloud.google.com" ||
 		strings.HasSuffix(rule.Group, ".cnrm.cloud.google.com") ||
 		rule.Group == "cnrm.cloud.google.com") && rule.Version == "*" && rule.Kind == "*"

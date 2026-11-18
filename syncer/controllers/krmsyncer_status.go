@@ -17,7 +17,8 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -98,9 +99,19 @@ var legacyConditionTypes = []string{"Active", "Suspended", "InvalidRule"}
 // several joined setup errors.
 const maxConditionMessageLen = 4096
 
-// maxFailureGroupsInMessage is the number of error categories listed in the
-// Ready condition message.
-const maxFailureGroupsInMessage = 5
+// Limits of the failures listed in the Ready condition message: errors, and
+// kinds per error. The rest are counted ("and 2 more kinds").
+const (
+	maxErrorsInMessage        = 5
+	maxKindsPerErrorInMessage = 3
+)
+
+// syncFailure is an error category (e.g. "apply failed (Forbidden)") and a kind
+// it affects (e.g. "Service", "TestCRD.e2e.gkelabs.io").
+type syncFailure struct {
+	category string
+	kind     string
+}
 
 // setReadyCondition sets status.failedObjects, observedGeneration and the
 // Ready condition of krmsyncer from the result of its latest setup (setupErr),
@@ -112,8 +123,11 @@ func (r *KRMSyncerReconciler) setReadyCondition(krmsyncer *krmv1alpha1.KRMSyncer
 		ObservedGeneration: krmsyncer.Generation,
 	}
 	remoteErr := r.remoteUnreachable(krmsyncer)
-	failed, categories := r.syncFailures.failures(client.ObjectKeyFromObject(krmsyncer))
+	failed, failures := r.syncFailures.failures(client.ObjectKeyFromObject(krmsyncer))
 	krmsyncer.Status.FailedObjects = int32(failed)
+	// Kinds the remote refuses to serve (403/5xx) are reported with the
+	// failed objects.
+	failures = append(failures, r.remoteKindFailures(krmsyncer)...)
 	switch {
 	case krmsyncer.Spec.Suspend:
 		cond.Status = metav1.ConditionTrue
@@ -127,10 +141,10 @@ func (r *KRMSyncerReconciler) setReadyCondition(krmsyncer *krmv1alpha1.KRMSyncer
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = krmv1alpha1.ReasonSetupFailed
 		cond.Message = setupErr.Error()
-	case failed > 0:
+	case len(failures) > 0:
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = krmv1alpha1.ReasonSyncFailed
-		cond.Message = failedObjectsMessage(categories)
+		cond.Message = failuresMessage(failures)
 	default:
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = krmv1alpha1.ReasonSyncing
@@ -146,17 +160,45 @@ func (r *KRMSyncerReconciler) setReadyCondition(krmsyncer *krmv1alpha1.KRMSyncer
 	krmsyncer.Status.ObservedGeneration = krmsyncer.Generation
 }
 
-// failedObjectsMessage lists the error categories of the failed objects, e.g.
-// "apply failed (Forbidden), destination object missing. See the controller
-// logs for details." The number of failed objects is in status.failedObjects,
-// and the errors in the controller logs. categories must be sorted, so the
-// message only changes when the set of categories changes.
-func failedObjectsMessage(categories []string) string {
-	if len(categories) > maxFailureGroupsInMessage {
-		more := len(categories) - maxFailureGroupsInMessage
-		categories = append(categories[:maxFailureGroupsInMessage:maxFailureGroupsInMessage], fmt.Sprintf("and %d more", more))
+// failuresMessage describes failures grouped by error, each with the kinds it
+// affects, e.g. "apply failed (Forbidden): Service; destination object missing:
+// TestCRD.e2e.gkelabs.io, TestCRD2.e2e.gkelabs.io, TestCRD3.e2e.gkelabs.io, and
+// 5 more kinds. See the controller logs for details." Errors and kinds are
+// sorted, so the message only changes when the failures change. The number of
+// failed objects is in status.failedObjects, and the errors in the controller
+// logs.
+func failuresMessage(failures []syncFailure) string {
+	kindsByCategory := make(map[string][]string)
+	for _, f := range failures {
+		if !slices.Contains(kindsByCategory[f.category], f.kind) {
+			kindsByCategory[f.category] = append(kindsByCategory[f.category], f.kind)
+		}
 	}
-	return strings.Join(categories, ", ") + ". See the controller logs for details."
+	categories := slices.Sorted(maps.Keys(kindsByCategory))
+
+	var groups []string
+	for i, category := range categories {
+		if i == maxErrorsInMessage {
+			groups = append(groups, "and "+countNoun(len(categories)-i, "more error", "more errors"))
+			break
+		}
+		kinds := kindsByCategory[category]
+		slices.Sort(kinds)
+		if len(kinds) > maxKindsPerErrorInMessage {
+			more := len(kinds) - maxKindsPerErrorInMessage
+			kinds = append(kinds[:maxKindsPerErrorInMessage:maxKindsPerErrorInMessage], "and "+countNoun(more, "more kind", "more kinds"))
+		}
+		groups = append(groups, category+": "+strings.Join(kinds, ", "))
+	}
+	return strings.Join(groups, "; ") + ". See the controller logs for details."
+}
+
+// countNoun returns n with the singular or plural noun, e.g. "2 more kinds".
+func countNoun(n int, singular, plural string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, singular)
+	}
+	return fmt.Sprintf("%d %s", n, plural)
 }
 
 // writeStatus writes the status of krmsyncer if it differs from orig's.
@@ -167,12 +209,11 @@ func (r *KRMSyncerReconciler) writeStatus(ctx context.Context, orig, krmsyncer *
 	return client.IgnoreNotFound(r.Status().Patch(ctx, krmsyncer, client.MergeFrom(orig)))
 }
 
-// remoteUnreachable returns why the remote cluster of a Pull mode KRMSyncer
-// is unreachable, or nil if it is reachable (or not tracked).
+// remoteUnreachable returns why the remote cluster of a KRMSyncer is
+// unreachable, or nil if it is reachable (or not tracked). In Pull mode the
+// remote is watched continuously; in Push mode it is only used, so observed,
+// while syncing.
 func (r *KRMSyncerReconciler) remoteUnreachable(krmsyncer *krmv1alpha1.KRMSyncer) error {
-	if syncerMode(krmsyncer) != krmv1alpha1.ModePull {
-		return nil
-	}
 	key, err := r.RemoteConfigProvider.Key(krmsyncer.Namespace, krmsyncer.Spec.Remote)
 	if err != nil {
 		return nil
@@ -186,6 +227,30 @@ func (r *KRMSyncerReconciler) remoteUnreachable(krmsyncer *krmv1alpha1.KRMSyncer
 		name = key
 	}
 	return fmt.Errorf("remote cluster %s: %w", name, err)
+}
+
+// remoteKindFailures returns, for a Pull mode KRMSyncer, the kinds it syncs
+// that its remote refuses to serve (403 or 5xx on list/watch), e.g.
+// "watch failed (Forbidden)" for TestCRD.e2e.gkelabs.io.
+func (r *KRMSyncerReconciler) remoteKindFailures(krmsyncer *krmv1alpha1.KRMSyncer) []syncFailure {
+	if syncerMode(krmsyncer) != krmv1alpha1.ModePull {
+		return nil
+	}
+	key, err := r.RemoteConfigProvider.Key(krmsyncer.Namespace, krmsyncer.Spec.Remote)
+	if err != nil {
+		return nil
+	}
+	h := r.remotes.lookup(key)
+	if h == nil {
+		return nil
+	}
+	var failures []syncFailure
+	for gvk, reason := range h.failedKinds() {
+		if slices.ContainsFunc(krmsyncer.Spec.Rules, func(rule krmv1alpha1.ResourceRule) bool { return ruleMatchesGVK(rule, gvk) }) {
+			failures = append(failures, syncFailure{category: fmt.Sprintf("watch failed (%s)", reason), kind: gvk.GroupKind().String()})
+		}
+	}
+	return failures
 }
 
 // The trackers below hold the state that KRMSyncer status and metrics report:
@@ -370,23 +435,23 @@ func (t *syncFailureTracker) addLocked(obj objectRef, delta int) {
 }
 
 // failures returns the number of objects failing for syncer, and their
-// distinct error categories, sorted.
-func (t *syncFailureTracker) failures(syncer types.NamespacedName) (int, []string) {
+// distinct (error category, kind) pairs.
+func (t *syncFailureTracker) failures(syncer types.NamespacedName) (int, []syncFailure) {
 	if t == nil {
 		return 0, nil
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	seen := make(map[string]bool)
-	var categories []string
-	for _, category := range t.failed[syncer] {
-		if !seen[category] {
-			seen[category] = true
-			categories = append(categories, category)
+	seen := make(map[syncFailure]bool)
+	var failures []syncFailure
+	for obj, category := range t.failed[syncer] {
+		f := syncFailure{category: category, kind: obj.GVK.GroupKind().String()}
+		if !seen[f] {
+			seen[f] = true
+			failures = append(failures, f)
 		}
 	}
-	sort.Strings(categories)
-	return len(t.failed[syncer]), categories
+	return len(t.failed[syncer]), failures
 }
 
 // remoteHealthTracker tracks the reachability of each remote cluster, keyed by
@@ -417,6 +482,17 @@ func (t *remoteHealthTracker) get(key string) *remoteHealth {
 	h := &remoteHealth{}
 	t.remotes[key] = h
 	return h
+}
+
+// lookup returns the health of the remote key, or nil if no connection to it
+// was made.
+func (t *remoteHealthTracker) lookup(key string) *remoteHealth {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.remotes[key]
 }
 
 // unreachable returns why the remote key is unreachable, or nil if it is

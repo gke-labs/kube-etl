@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -30,6 +29,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -202,37 +202,55 @@ func TestReadyCondition(t *testing.T) {
 		// Failures of other KRMSyncers are not counted.
 		r.syncFailures.markFailed(types.NamespacedName{Namespace: "default", Name: "other"}, svc("e"), "delete failed")
 
-		// The message lists the error categories, sorted; the count is in
-		// failedObjects.
+		// The message groups the failures by error, with the kinds each one
+		// affects; the count is in failedObjects.
 		s, ready, err := reconcileReady(t, r, c, key)
 		require.NoError(t, err, "failed objects are retried by their own controllers")
 		assert.Equal(t, int32(3), s.Status.FailedObjects)
 		assert.Equal(t, metav1.ConditionFalse, ready.Status)
 		assert.Equal(t, krmv1alpha1.ReasonSyncFailed, ready.Reason)
-		assert.Equal(t, "apply failed (Forbidden), destination object missing. See the controller logs for details.", ready.Message)
+		assert.Equal(t, "apply failed (Forbidden): Service; destination object missing: Service. See the controller logs for details.", ready.Message)
 
 		// An object failing with another error moves to that category. While
-		// the set of categories is the same, so is the message.
+		// the set of failures is the same, so is the message.
 		r.syncFailures.markFailed(key, svc("a"), forbidden)
 		s, ready, err = reconcileReady(t, r, c, key)
 		require.NoError(t, err)
 		assert.Equal(t, int32(3), s.Status.FailedObjects)
-		assert.Equal(t, "apply failed (Forbidden), destination object missing. See the controller logs for details.", ready.Message)
+		assert.Equal(t, "apply failed (Forbidden): Service; destination object missing: Service. See the controller logs for details.", ready.Message)
 		r.syncFailures.markFailed(key, svc("c"), forbidden)
 		_, ready, err = reconcileReady(t, r, c, key)
 		require.NoError(t, err)
-		assert.Equal(t, "apply failed (Forbidden). See the controller logs for details.", ready.Message)
+		assert.Equal(t, "apply failed (Forbidden): Service. See the controller logs for details.", ready.Message)
 
-		// At most maxFailureGroupsInMessage categories are listed.
+		// At most maxErrorsInMessage errors are listed.
 		for i, name := range []string{"d", "e", "f", "g", "h"} {
 			r.syncFailures.markFailed(key, svc(name), fmt.Sprintf("category %d", i))
 		}
 		_, ready, err = reconcileReady(t, r, c, key)
 		require.NoError(t, err)
-		assert.Equal(t, "apply failed (Forbidden), category 0, category 1, category 2, category 3, and 1 more. See the controller logs for details.", ready.Message)
-
-		for _, name := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		assert.Equal(t, "apply failed (Forbidden): Service; category 0: Service; category 1: Service; category 2: Service; category 3: Service; and 1 more error. See the controller logs for details.", ready.Message)
+		for _, name := range []string{"a", "c", "d", "e", "f", "g", "h"} {
 			r.syncFailures.markSucceeded(key, svc(name))
+		}
+
+		// At most maxKindsPerErrorInMessage kinds are listed per error, and an
+		// error with many kinds does not hide the others.
+		testCRD := func(kind string) objectRef {
+			return objectRef{GVK: schema.GroupVersionKind{Group: "e2e.gkelabs.io", Version: "v1alpha1", Kind: kind}, Key: types.NamespacedName{Namespace: "ns", Name: "obj"}}
+		}
+		kinds := []string{"TestCRD", "TestCRD2", "TestCRD3", "TestCRD4", "TestCRD5", "TestCRD6", "TestCRD7", "TestCRD8"}
+		for _, kind := range kinds {
+			r.syncFailures.markFailed(key, testCRD(kind), missing)
+		}
+		s, ready, err = reconcileReady(t, r, c, key)
+		require.NoError(t, err)
+		assert.Equal(t, int32(9), s.Status.FailedObjects)
+		assert.Equal(t, "apply failed (Forbidden): Service; destination object missing: TestCRD.e2e.gkelabs.io, TestCRD2.e2e.gkelabs.io, TestCRD3.e2e.gkelabs.io, and 5 more kinds. See the controller logs for details.", ready.Message)
+
+		r.syncFailures.markSucceeded(key, svc("b"))
+		for _, kind := range kinds {
+			r.syncFailures.markSucceeded(key, testCRD(kind))
 		}
 		s, ready, err = reconcileReady(t, r, c, key)
 		require.NoError(t, err)
@@ -262,16 +280,7 @@ type flakyRoundTripper struct {
 
 func (rt *flakyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if code := int(rt.status.Load()); code != 0 {
-		text := http.StatusText(code)
-		body := fmt.Sprintf(`{"kind":"Status","apiVersion":"v1","status":"Failure","message":%q,"reason":%q,"code":%d}`, text, strings.ReplaceAll(text, " ", ""), code)
-		return &http.Response{
-			Status:     fmt.Sprintf("%d %s", code, text),
-			StatusCode: code,
-			Proto:      "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
-			Header:  http.Header{"Content-Type": {"application/json"}},
-			Body:    io.NopCloser(strings.NewReader(body)),
-			Request: req,
-		}, nil
+		return statusResponse(req, code, http.StatusText(code)), nil
 	}
 	resp, err := rt.base.RoundTrip(req)
 	if err != nil {
@@ -319,17 +328,7 @@ func (b *trackedBody) Close() error {
 func TestReadyRemoteUnreachableAfterSetup(t *testing.T) {
 	ctx := t.Context()
 
-	// Use a new remote cluster on each run: the informers of a remote that
-	// already failed retry with a longer backoff, which would slow down
-	// recovery on repeated runs (-count).
-	clusterName := "dest-flaky-" + utilrand.String(5)
-	flaky := &flakyRoundTripper{}
-	cfg := rest.CopyConfig(cfgDest)
-	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
-		flaky.base = rt
-		return flaky
-	})
-	testRemoteProvider.add(clusterName, cfg)
+	clusterName, flaky := newFlakyRemote()
 
 	syncer := &krmv1alpha1.KRMSyncer{
 		ObjectMeta: metav1.ObjectMeta{Name: "syncer-" + clusterName, Namespace: "default"},
@@ -346,18 +345,7 @@ func TestReadyRemoteUnreachableAfterSetup(t *testing.T) {
 
 	waitForReady := func(status metav1.ConditionStatus, reason, message string) {
 		t.Helper()
-		var last *metav1.Condition
-		err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 60*time.Second, true, func(ctx context.Context) (bool, error) {
-			s := &krmv1alpha1.KRMSyncer{}
-			if err := k8sClientSource.Get(ctx, client.ObjectKeyFromObject(syncer), s); err != nil {
-				return false, nil
-			}
-			last = meta.FindStatusCondition(s.Status.Conditions, krmv1alpha1.ConditionReady)
-			return last != nil && last.Status == status && last.Reason == reason &&
-				(message == "" || last.Message == message) &&
-				s.Status.ObservedGeneration == s.Generation, nil
-		})
-		require.NoError(t, err, "want Ready=%s/%s, last: %+v", status, reason, last)
+		waitForReadyCondition(ctx, t, syncer, status, reason, message)
 	}
 
 	waitForReady(metav1.ConditionTrue, krmv1alpha1.ReasonSyncing, "")
@@ -370,4 +358,142 @@ func TestReadyRemoteUnreachableAfterSetup(t *testing.T) {
 	// The remote recovers.
 	flaky.failWith(0)
 	waitForReady(metav1.ConditionTrue, krmv1alpha1.ReasonSyncing, "")
+
+	// The remote refuses to serve a synced kind: reported for that kind, not
+	// as an unreachable remote.
+	flaky.failWith(http.StatusForbidden)
+	waitForReady(metav1.ConditionFalse, krmv1alpha1.ReasonSyncFailed,
+		"watch failed (Forbidden): ConfigMap. See the controller logs for details.")
+
+	flaky.failWith(0)
+	waitForReady(metav1.ConditionTrue, krmv1alpha1.ReasonSyncing, "")
+}
+
+// TestReadyRemoteUnreachablePush verifies that a Push mode destination that
+// fails (401) is reported as RemoteUnreachable when syncing, and that Ready
+// recovers once syncing succeeds again.
+func TestReadyRemoteUnreachablePush(t *testing.T) {
+	ctx := t.Context()
+	clusterName, flaky := newFlakyRemote()
+	ns := "push-" + clusterName
+	require.NoError(t, k8sClientSource.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}))
+
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: "syncer", Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(clusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{Version: "v1", Kind: "Service", Namespaces: []string{ns}, SyncFields: []string{"spec"}},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: ns},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 80}}},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, svc))
+	defer func() { _ = k8sClientSource.Delete(ctx, svc) }()
+
+	// Push talks to the destination while syncing: the first sync succeeds.
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		return k8sClientDest.Get(ctx, client.ObjectKeyFromObject(svc), &corev1.Service{}) == nil, nil
+	})
+	require.NoError(t, err, "Service should be pushed to the destination")
+	waitForReadyCondition(ctx, t, syncer, metav1.ConditionTrue, krmv1alpha1.ReasonSyncing, "")
+
+	// The destination starts rejecting our credentials; the next sync fails.
+	flaky.failWith(http.StatusUnauthorized)
+	require.NoError(t, k8sClientSource.Get(ctx, client.ObjectKeyFromObject(svc), svc))
+	svc.Spec.Ports[0].Port = 8080
+	require.NoError(t, k8sClientSource.Update(ctx, svc))
+	waitForReadyCondition(ctx, t, syncer, metav1.ConditionFalse, krmv1alpha1.ReasonRemoteUnreachable,
+		"remote cluster projects/test-project/locations/us-central1/clusters/"+clusterName+": Unauthorized")
+
+	// The destination recovers: the retried sync succeeds.
+	flaky.failWith(0)
+	waitForReadyCondition(ctx, t, syncer, metav1.ConditionTrue, krmv1alpha1.ReasonSyncing, "")
+}
+
+// newFlakyRemote registers a new remote cluster (resolving to the destination
+// cluster) whose requests can be made to fail, and returns its name. A new
+// remote is used on each run: the informers of a remote that already failed
+// retry with a longer backoff, which would slow down repeated runs (-count).
+func newFlakyRemote() (string, *flakyRoundTripper) {
+	clusterName := "dest-flaky-" + utilrand.String(5)
+	flaky := &flakyRoundTripper{}
+	cfg := rest.CopyConfig(cfgDest)
+	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		flaky.base = rt
+		return flaky
+	})
+	testRemoteProvider.add(clusterName, cfg)
+	return clusterName, flaky
+}
+
+// waitForReadyCondition waits until syncer has the Ready condition (and, if
+// set, message), for its current generation.
+func waitForReadyCondition(ctx context.Context, t *testing.T, syncer *krmv1alpha1.KRMSyncer, status metav1.ConditionStatus, reason, message string) {
+	t.Helper()
+	var last *metav1.Condition
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 60*time.Second, true, func(ctx context.Context) (bool, error) {
+		s := &krmv1alpha1.KRMSyncer{}
+		if err := k8sClientSource.Get(ctx, client.ObjectKeyFromObject(syncer), s); err != nil {
+			return false, nil
+		}
+		last = meta.FindStatusCondition(s.Status.Conditions, krmv1alpha1.ConditionReady)
+		return last != nil && last.Status == status && last.Reason == reason &&
+			(message == "" || last.Message == message) &&
+			s.Status.ObservedGeneration == s.Generation, nil
+	})
+	require.NoError(t, err, "want Ready=%s/%s, last: %+v", status, reason, last)
+}
+
+// TestReadyRemoteKindFailures verifies that kinds the remote refuses to serve
+// (403/5xx) are reported per kind, only for KRMSyncers syncing them, and that
+// RemoteUnreachable takes precedence.
+func TestReadyRemoteKindFailures(t *testing.T) {
+	remote := testRemote("refusing")
+	key, err := testRemoteProvider.Key("default", remote)
+	require.NoError(t, err)
+	configMaps := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	testCRDs := schema.GroupVersionKind{Group: "e2e.gkelabs.io", Version: "v1alpha1", Kind: "TestCRD"}
+	mapper := meta.NewDefaultRESTMapper(nil)
+	mapper.Add(configMaps, meta.RESTScopeNamespace)
+	mapper.Add(testCRDs, meta.RESTScopeNamespace)
+
+	r := &KRMSyncerReconciler{RemoteConfigProvider: testRemoteProvider, remotes: newRemoteHealthTracker()}
+	h := r.remotes.get(key)
+	h.setMapper(mapper)
+	h.markResource(schema.GroupVersionResource{Group: "e2e.gkelabs.io", Version: "v1alpha1", Resource: "testcrds"}, "Forbidden")
+	h.markResource(schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}, "InternalError")
+
+	ready := func(rules ...krmv1alpha1.ResourceRule) *metav1.Condition {
+		t.Helper()
+		s := &krmv1alpha1.KRMSyncer{
+			ObjectMeta: metav1.ObjectMeta{Name: "syncer", Namespace: "default"},
+			Spec:       krmv1alpha1.KRMSyncerSpec{Mode: krmv1alpha1.ModePull, Remote: remote, Rules: rules},
+		}
+		r.setReadyCondition(s, nil)
+		return meta.FindStatusCondition(s.Status.Conditions, krmv1alpha1.ConditionReady)
+	}
+	both := []krmv1alpha1.ResourceRule{{Version: "v1", Kind: "ConfigMap"}, {Group: "e2e.gkelabs.io", Version: "v1alpha1", Kind: "TestCRD"}}
+
+	cond := ready(both...)
+	assert.Equal(t, krmv1alpha1.ReasonSyncFailed, cond.Reason)
+	assert.Equal(t, "watch failed (Forbidden): TestCRD.e2e.gkelabs.io; watch failed (InternalError): ConfigMap. See the controller logs for details.", cond.Message)
+
+	// Only kinds the KRMSyncer syncs are reported.
+	cond = ready(krmv1alpha1.ResourceRule{Version: "v1", Kind: "ConfigMap"})
+	assert.Equal(t, "watch failed (InternalError): ConfigMap. See the controller logs for details.", cond.Message)
+	cond = ready(krmv1alpha1.ResourceRule{Version: "v1", Kind: "Secret"})
+	assert.Equal(t, krmv1alpha1.ReasonSyncing, cond.Reason)
+
+	// An unreachable remote takes precedence.
+	h.markUnreachable(stderrors.New("Unauthorized"))
+	cond = ready(both...)
+	assert.Equal(t, krmv1alpha1.ReasonRemoteUnreachable, cond.Reason)
 }

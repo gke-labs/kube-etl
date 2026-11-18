@@ -21,6 +21,7 @@ import (
 	"fmt"
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
+	"io"
 	"k8s.io/client-go/rest"
 	"net/http"
 	"os"
@@ -86,17 +87,33 @@ type faultInjectingRoundTripper struct {
 	failStatus atomic.Bool
 }
 
+// RoundTrip fails the selected requests as the server would (500), so they
+// are object sync failures, not an unreachable remote.
 func (rt *faultInjectingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Method == http.MethodPatch && rt.failStatus.Load() && strings.HasSuffix(req.URL.Path, "/status") {
-		return nil, stderrors.New("injected status patch failure")
+		return statusResponse(req, http.StatusInternalServerError, "injected status patch failure"), nil
 	}
 	if req.Method == http.MethodPatch && rt.failPatch.Load() && !strings.HasSuffix(req.URL.Path, "/status") {
-		return nil, stderrors.New("injected apply patch failure")
+		return statusResponse(req, http.StatusInternalServerError, "injected apply patch failure"), nil
 	}
 	if req.Method == http.MethodDelete && rt.failDelete.Load() {
-		return nil, stderrors.New("injected delete failure")
+		return statusResponse(req, http.StatusInternalServerError, "injected delete failure"), nil
 	}
 	return rt.base.RoundTrip(req)
+}
+
+// statusResponse returns a Kubernetes API error response (a Status) with the
+// HTTP status code and message.
+func statusResponse(req *http.Request, code int, message string) *http.Response {
+	body := fmt.Sprintf(`{"kind":"Status","apiVersion":"v1","status":"Failure","message":%q,"reason":%q,"code":%d}`, message, statusReason(code), code)
+	return &http.Response{
+		Status:     fmt.Sprintf("%d %s", code, http.StatusText(code)),
+		StatusCode: code,
+		Proto:      "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header:  http.Header{"Content-Type": {"application/json"}},
+		Body:    io.NopCloser(strings.NewReader(body)),
+		Request: req,
+	}
 }
 
 // testConfigProvider resolves fake GKE clusters (by name) to envtest clusters.
@@ -995,8 +1012,8 @@ func TestSyncerStatusModeMissingDestination(t *testing.T) {
 	assert.Equal(t, 1.0, testutil.ToFloat64(failedObjects),
 		"missing destination object should be counted as failed")
 	assert.Equal(t, 1, syncerFailures(), "the failure should be counted for the KRMSyncer")
-	_, categories := syncFailures.failures(client.ObjectKeyFromObject(syncer))
-	assert.Equal(t, []string{"destination object missing"}, categories)
+	_, failures := syncFailures.failures(client.ObjectKeyFromObject(syncer))
+	assert.Equal(t, []syncFailure{{category: "destination object missing", kind: "Service"}}, failures)
 
 	// Retrying while the destination object is still missing counts it once.
 	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})

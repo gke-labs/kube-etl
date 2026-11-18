@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func gkeRemote(project, location, name string) *krmv1alpha1.RemoteConfig {
@@ -330,40 +332,54 @@ func TestHealthTransport(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 
+	const (
+		discovery = "/apis"
+		testCRDs  = "/apis/e2e.gkelabs.io/v1alpha1/namespaces/default/testcrds"
+		services  = "/api/v1/services"
+	)
+	testCRDsGVR := schema.GroupVersionResource{Group: "e2e.gkelabs.io", Version: "v1alpha1", Resource: "testcrds"}
+	servicesGVR := schema.GroupVersionResource{Version: "v1", Resource: "services"}
+
 	for _, step := range []struct {
 		name string
+		path string
 		code int
 		err  error
 		ctx  context.Context
 		// wantErr is the expected unreachable error ("" if reachable).
 		wantErr string
+		// wantResources are the expected failed resources.
+		wantResources map[schema.GroupVersionResource]string
 	}{
-		{name: "2xx while reachable", code: 200},
-		{name: "401", code: 401, wantErr: "Unauthorized"},
-		{name: "401 again", code: 401, wantErr: "Unauthorized"},
-		{name: "403 updates the error", code: 403, wantErr: "Forbidden"},
-		{name: "404 is ignored", code: 404, wantErr: "Forbidden"},
-		{name: "409 is ignored", code: 409, wantErr: "Forbidden"},
-		{name: "201", code: 201},
-		{name: "204", code: 204},
-		{name: "500", code: 500, wantErr: "Internal Server Error"},
-		{name: "200", code: 200},
-		{name: "503", code: 503, wantErr: "Service Unavailable"},
-		{name: "unknown 5xx", code: 599, wantErr: "HTTP status 599"},
-		{name: "200 again", code: 200},
-		{name: "network error", err: errors.New("connection refused"), wantErr: "connection refused"},
-		{name: "200 after network error", code: 200},
-		{name: "cancelled request is ignored", err: context.Canceled, ctx: cancelled},
-		{name: "wrapped cancellation is ignored", err: fmt.Errorf("watch: %w", context.Canceled)},
-		{name: "deadline exceeded", err: context.DeadlineExceeded, wantErr: "context deadline exceeded"},
-		{name: "429 is ignored", code: 429, wantErr: "context deadline exceeded"},
+		{name: "2xx", path: discovery, code: 200},
+		{name: "401", path: discovery, code: 401, wantErr: "Unauthorized"},
+		{name: "401 again", path: testCRDs, code: 401, wantErr: "Unauthorized"},
+		{name: "any other response means reachable", path: discovery, code: 404},
+		{name: "network error", path: discovery, err: errors.New("connection refused"), wantErr: "connection refused"},
+		{name: "deadline exceeded", path: discovery, err: context.DeadlineExceeded, wantErr: "context deadline exceeded"},
+		{name: "cancelled request is ignored", path: discovery, err: context.Canceled, ctx: cancelled, wantErr: "context deadline exceeded"},
+		{name: "wrapped cancellation is ignored", path: discovery, err: fmt.Errorf("watch: %w", context.Canceled), wantErr: "context deadline exceeded"},
+		{name: "5xx means reachable", path: discovery, code: 503},
+
+		// 403 and 5xx on a resource are reported for that resource.
+		{name: "403 on a resource", path: testCRDs, code: 403,
+			wantResources: map[schema.GroupVersionResource]string{testCRDsGVR: "Forbidden"}},
+		{name: "5xx on another resource", path: services, code: 500,
+			wantResources: map[schema.GroupVersionResource]string{testCRDsGVR: "Forbidden", servicesGVR: "InternalError"}},
+		{name: "404 on a resource does not clear it", path: testCRDs, code: 404,
+			wantResources: map[schema.GroupVersionResource]string{testCRDsGVR: "Forbidden", servicesGVR: "InternalError"}},
+		{name: "2xx on a resource clears it", path: testCRDs + "/obj", code: 200,
+			wantResources: map[schema.GroupVersionResource]string{servicesGVR: "InternalError"}},
+		{name: "401 keeps resource failures", path: services, code: 401, wantErr: "Unauthorized",
+			wantResources: map[schema.GroupVersionResource]string{servicesGVR: "InternalError"}},
+		{name: "recovered", path: services, code: 200},
 	} {
 		nextCode, nextErr = step.code, step.err
 		ctx := step.ctx
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://remote/api", nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://remote"+step.path, nil)
 		require.NoError(t, err)
 		resp, err := rt.RoundTrip(req)
 		if step.err != nil {
@@ -378,5 +394,33 @@ func TestHealthTransport(t *testing.T) {
 		} else {
 			assert.EqualError(t, h.unreachable(), step.wantErr, step.name)
 		}
+		h.mu.Lock()
+		got := maps.Clone(h.failedResources)
+		h.mu.Unlock()
+		if len(step.wantResources) == 0 {
+			assert.Empty(t, got, step.name)
+		} else {
+			assert.Equal(t, step.wantResources, got, step.name)
+		}
+	}
+}
+
+func TestRequestResource(t *testing.T) {
+	for path, want := range map[string]schema.GroupVersionResource{
+		"/api/v1/services":                                          {Version: "v1", Resource: "services"},
+		"/api/v1/namespaces/ns/services/svc":                        {Version: "v1", Resource: "services"},
+		"/api/v1/namespaces/ns":                                     {Version: "v1", Resource: "namespaces"},
+		"/api/v1/namespaces":                                        {Version: "v1", Resource: "namespaces"},
+		"/apis/apps/v1/deployments":                                 {Group: "apps", Version: "v1", Resource: "deployments"},
+		"/apis/apps/v1/namespaces/ns/deployments/d/status":          {Group: "apps", Version: "v1", Resource: "deployments"},
+		"/apis/e2e.gkelabs.io/v1alpha1/namespaces/default/testcrds": {Group: "e2e.gkelabs.io", Version: "v1alpha1", Resource: "testcrds"},
+	} {
+		got, ok := requestResource(path)
+		assert.True(t, ok, path)
+		assert.Equal(t, want, got, path)
+	}
+	for _, path := range []string{"/api", "/api/v1", "/apis", "/apis/apps", "/apis/apps/v1", "/version", "/healthz"} {
+		_, ok := requestResource(path)
+		assert.False(t, ok, path)
 	}
 }

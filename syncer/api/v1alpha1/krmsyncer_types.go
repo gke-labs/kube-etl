@@ -128,14 +128,16 @@ const (
 	// This is an expected state for the KRMSyncer in a standby cluster.
 	ReasonSuspended = "Suspended"
 	// ReasonRemoteUnreachable (Ready=False): the latest requests to the remote
-	// cluster failed (network error, 401, 403 or 5xx).
+	// cluster failed with a network error or 401 (Unauthorized).
 	ReasonRemoteUnreachable = "RemoteUnreachable"
 	// ReasonSetupFailed (Ready=False): the latest setup attempt (API
 	// discovery, rule expansion, connecting to the remote cluster, starting
 	// watches) failed. It is retried with backoff.
 	ReasonSetupFailed = "SetupFailed"
 	// ReasonSyncFailed (Ready=False): the latest sync attempt of some objects
-	// failed (see status.failedObjects). They are retried with backoff.
+	// failed (see status.failedObjects), or the remote cluster refuses to serve
+	// some synced kinds (403 or 5xx). The message lists the errors per kind.
+	// Failures are retried with backoff.
 	ReasonSyncFailed = "SyncFailed"
 )
 
