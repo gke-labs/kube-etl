@@ -125,7 +125,7 @@ func (r *KRMSyncerReconciler) setReadyCondition(krmsyncer *krmv1alpha1.KRMSyncer
 	krmsyncer.Status.FailedObjects = int32(failed)
 	switch {
 	case krmsyncer.Spec.Suspend:
-		cond.Status = metav1.ConditionFalse
+		cond.Status = metav1.ConditionTrue
 		cond.Reason = krmv1alpha1.ReasonSuspended
 		cond.Message = "Sync is suspended by spec.suspend"
 	case remoteErr != nil:

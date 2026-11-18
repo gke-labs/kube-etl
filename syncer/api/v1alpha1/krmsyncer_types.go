@@ -124,7 +124,8 @@ const (
 	// ReasonSyncing (Ready=True): setup succeeded, the remote cluster is
 	// reachable and no object is failing to sync.
 	ReasonSyncing = "Syncing"
-	// ReasonSuspended (Ready=False): spec.suspend is set.
+	// ReasonSuspended (Ready=True): spec.suspend is set, so nothing is synced.
+	// This is an expected state for the KRMSyncer in a standby cluster.
 	ReasonSuspended = "Suspended"
 	// ReasonRemoteUnreachable (Ready=False): the latest requests to the remote
 	// cluster failed (network error, 401, 403 or 5xx).

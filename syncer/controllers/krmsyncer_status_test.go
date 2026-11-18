@@ -119,7 +119,7 @@ func TestReadyCondition(t *testing.T) {
 		require.NoError(t, c.Update(ctx, s))
 		_, ready, err = reconcileReady(t, r, c, key)
 		require.NoError(t, err)
-		assert.Equal(t, metav1.ConditionFalse, ready.Status)
+		assert.Equal(t, metav1.ConditionTrue, ready.Status, "a suspended KRMSyncer is Ready")
 		assert.Equal(t, krmv1alpha1.ReasonSuspended, ready.Reason)
 		assert.Equal(t, int32(2), statusWrites.Load())
 		_, _, err = reconcileReady(t, r, c, key)
