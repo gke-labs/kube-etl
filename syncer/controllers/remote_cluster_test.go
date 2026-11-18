@@ -324,8 +324,7 @@ func TestHealthTransport(t *testing.T) {
 		}
 		return &http.Response{StatusCode: nextCode, Body: http.NoBody, Request: req}, nil
 	})
-	var notifications int
-	h := &remoteHealth{onChange: func() { notifications++ }}
+	h := &remoteHealth{}
 	rt := h.wrap(base)
 
 	cancelled, cancel := context.WithCancel(context.Background())
@@ -337,28 +336,27 @@ func TestHealthTransport(t *testing.T) {
 		err  error
 		ctx  context.Context
 		// wantErr is the expected unreachable error ("" if reachable).
-		wantErr           string
-		wantNotifications int
+		wantErr string
 	}{
-		{name: "2xx while reachable", code: 200, wantNotifications: 0},
-		{name: "401", code: 401, wantErr: "Unauthorized", wantNotifications: 1},
-		{name: "401 again", code: 401, wantErr: "Unauthorized", wantNotifications: 1},
-		{name: "403 updates the error", code: 403, wantErr: "Forbidden", wantNotifications: 1},
-		{name: "404 is ignored", code: 404, wantErr: "Forbidden", wantNotifications: 1},
-		{name: "409 is ignored", code: 409, wantErr: "Forbidden", wantNotifications: 1},
-		{name: "201", code: 201, wantNotifications: 2},
-		{name: "204", code: 204, wantNotifications: 2},
-		{name: "500", code: 500, wantErr: "Internal Server Error", wantNotifications: 3},
-		{name: "200", code: 200, wantNotifications: 4},
-		{name: "503", code: 503, wantErr: "Service Unavailable", wantNotifications: 5},
-		{name: "unknown 5xx", code: 599, wantErr: "HTTP status 599", wantNotifications: 5},
-		{name: "200 again", code: 200, wantNotifications: 6},
-		{name: "network error", err: errors.New("connection refused"), wantErr: "connection refused", wantNotifications: 7},
-		{name: "200 after network error", code: 200, wantNotifications: 8},
-		{name: "cancelled request is ignored", err: context.Canceled, ctx: cancelled, wantNotifications: 8},
-		{name: "wrapped cancellation is ignored", err: fmt.Errorf("watch: %w", context.Canceled), wantNotifications: 8},
-		{name: "deadline exceeded", err: context.DeadlineExceeded, wantErr: "context deadline exceeded", wantNotifications: 9},
-		{name: "429 is ignored", code: 429, wantErr: "context deadline exceeded", wantNotifications: 9},
+		{name: "2xx while reachable", code: 200},
+		{name: "401", code: 401, wantErr: "Unauthorized"},
+		{name: "401 again", code: 401, wantErr: "Unauthorized"},
+		{name: "403 updates the error", code: 403, wantErr: "Forbidden"},
+		{name: "404 is ignored", code: 404, wantErr: "Forbidden"},
+		{name: "409 is ignored", code: 409, wantErr: "Forbidden"},
+		{name: "201", code: 201},
+		{name: "204", code: 204},
+		{name: "500", code: 500, wantErr: "Internal Server Error"},
+		{name: "200", code: 200},
+		{name: "503", code: 503, wantErr: "Service Unavailable"},
+		{name: "unknown 5xx", code: 599, wantErr: "HTTP status 599"},
+		{name: "200 again", code: 200},
+		{name: "network error", err: errors.New("connection refused"), wantErr: "connection refused"},
+		{name: "200 after network error", code: 200},
+		{name: "cancelled request is ignored", err: context.Canceled, ctx: cancelled},
+		{name: "wrapped cancellation is ignored", err: fmt.Errorf("watch: %w", context.Canceled)},
+		{name: "deadline exceeded", err: context.DeadlineExceeded, wantErr: "context deadline exceeded"},
+		{name: "429 is ignored", code: 429, wantErr: "context deadline exceeded"},
 	} {
 		nextCode, nextErr = step.code, step.err
 		ctx := step.ctx
@@ -380,6 +378,5 @@ func TestHealthTransport(t *testing.T) {
 		} else {
 			assert.EqualError(t, h.unreachable(), step.wantErr, step.name)
 		}
-		assert.Equal(t, step.wantNotifications, notifications, "%s: notifications", step.name)
 	}
 }

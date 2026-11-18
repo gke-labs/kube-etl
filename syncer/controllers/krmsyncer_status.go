@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/prometheus/client_golang/prometheus"
@@ -34,19 +35,15 @@ import (
 
 // updateStatus computes the status of the KRMSyncer key from its latest setup
 // result and the trackers, and writes it if it changed. It is called at the end
-// of Reconcile and when a tracker reports a change. Nothing is written until
-// the current generation has been set up: Reconcile updates status when setup
-// completes.
+// of Reconcile, and for every KRMSyncer every statusUpdateInterval (see
+// updateAllStatus). Nothing is written until the current generation has been
+// set up: Reconcile updates status when setup completes.
 //
-// Updates are serialized, and each one reads the trackers when it runs, so the
-// last write reflects the latest state. The KRMSyncer is read from the API
-// server, not the cache, so a previous status write is never missed.
+// The KRMSyncer is read from the cache. If an update is based on a stale copy
+// or an older state of the trackers, the next periodic update corrects it.
 func (r *KRMSyncerReconciler) updateStatus(ctx context.Context, key types.NamespacedName) error {
-	r.statusMu.Lock()
-	defer r.statusMu.Unlock()
-
 	var krmsyncer krmv1alpha1.KRMSyncer
-	if err := r.apiReader().Get(ctx, key, &krmsyncer); err != nil {
+	if err := r.Get(ctx, key, &krmsyncer); err != nil {
 		return client.IgnoreNotFound(err)
 	}
 	setup, ok := r.setupFailures.result(key)
@@ -58,45 +55,39 @@ func (r *KRMSyncerReconciler) updateStatus(ctx context.Context, key types.Namesp
 	return r.writeStatus(ctx, orig, &krmsyncer)
 }
 
-// updateSyncerStatus updates the status of the KRMSyncer key when its failed
-// object count changes. It is called from a dynamic resource controller.
-func (r *KRMSyncerReconciler) updateSyncerStatus(key types.NamespacedName) {
-	ctx := context.Background()
-	if err := r.updateStatus(ctx, key); err != nil {
-		log.FromContext(ctx).Error(err, "Failed to update KRMSyncer status", "krmsyncer", key)
-	}
-}
+// statusUpdateInterval is how often the status of every KRMSyncer is
+// recomputed, to report changes of the trackers (failed objects, remote
+// reachability).
+const statusUpdateInterval = 2 * time.Second
 
-// updateRemoteSyncersStatus updates the status of the Pull mode KRMSyncers
-// using the remote key when its reachability changes. It is called from the
-// remote's transport, so it updates in the background to not delay the
-// request.
-func (r *KRMSyncerReconciler) updateRemoteSyncersStatus(key string) {
-	go func() {
-		ctx := context.Background()
+// updateAllStatus recomputes the status of every KRMSyncer every
+// statusUpdateInterval until ctx is done, writing it only when it changed. It
+// implements manager.RunnableFunc.
+//
+// Each KRMSyncer costs a cache read and a comparison per interval; the API
+// server is only called when its status changes, at most once per interval
+// however many objects start or stop failing.
+func (r *KRMSyncerReconciler) updateAllStatus(ctx context.Context) error {
+	ticker := time.NewTicker(statusUpdateInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
 		var list krmv1alpha1.KRMSyncerList
 		if err := r.List(ctx, &list); err != nil {
-			log.FromContext(ctx).Error(err, "Failed to list KRMSyncers for remote cluster", "remote", key)
-			return
+			log.FromContext(ctx).Error(err, "Failed to list KRMSyncers")
+			continue
 		}
 		for i := range list.Items {
-			s := &list.Items[i]
-			if syncerMode(s) != krmv1alpha1.ModePull {
-				continue
-			}
-			if k, err := r.RemoteConfigProvider.Key(s.Namespace, s.Spec.Remote); err == nil && k == key {
-				r.updateSyncerStatus(client.ObjectKeyFromObject(s))
+			key := client.ObjectKeyFromObject(&list.Items[i])
+			if err := r.updateStatus(ctx, key); err != nil {
+				log.FromContext(ctx).Error(err, "Failed to update KRMSyncer status", "krmsyncer", key)
 			}
 		}
-	}()
-}
-
-// apiReader reads directly from the API server (the client in tests).
-func (r *KRMSyncerReconciler) apiReader() client.Reader {
-	if r.Manager != nil {
-		return r.Manager.GetAPIReader()
 	}
-	return r.Client
 }
 
 // legacyConditionTypes are condition types written by earlier versions, which
@@ -121,7 +112,7 @@ func (r *KRMSyncerReconciler) setReadyCondition(krmsyncer *krmv1alpha1.KRMSyncer
 		ObservedGeneration: krmsyncer.Generation,
 	}
 	remoteErr := r.remoteUnreachable(krmsyncer)
-	failed, byCategory := r.syncFailures.failures(client.ObjectKeyFromObject(krmsyncer))
+	failed, categories := r.syncFailures.failures(client.ObjectKeyFromObject(krmsyncer))
 	krmsyncer.Status.FailedObjects = int32(failed)
 	switch {
 	case krmsyncer.Spec.Suspend:
@@ -139,7 +130,7 @@ func (r *KRMSyncerReconciler) setReadyCondition(krmsyncer *krmv1alpha1.KRMSyncer
 	case failed > 0:
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = krmv1alpha1.ReasonSyncFailed
-		cond.Message = failedObjectsMessage(byCategory)
+		cond.Message = failedObjectsMessage(categories)
 	default:
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = krmv1alpha1.ReasonSyncing
@@ -155,31 +146,17 @@ func (r *KRMSyncerReconciler) setReadyCondition(krmsyncer *krmv1alpha1.KRMSyncer
 	krmsyncer.Status.ObservedGeneration = krmsyncer.Generation
 }
 
-// failedObjectsMessage describes failed objects by error category, most
-// frequent first, e.g. "7 destination object missing, 3 apply failed
-// (Forbidden). See the controller logs for details." The number of failed
-// objects is in status.failedObjects, and the errors in the controller logs.
-func failedObjectsMessage(byCategory map[string]int) string {
-	categories := make([]string, 0, len(byCategory))
-	for c := range byCategory {
-		categories = append(categories, c)
+// failedObjectsMessage lists the error categories of the failed objects, e.g.
+// "apply failed (Forbidden), destination object missing. See the controller
+// logs for details." The number of failed objects is in status.failedObjects,
+// and the errors in the controller logs. categories must be sorted, so the
+// message only changes when the set of categories changes.
+func failedObjectsMessage(categories []string) string {
+	if len(categories) > maxFailureGroupsInMessage {
+		more := len(categories) - maxFailureGroupsInMessage
+		categories = append(categories[:maxFailureGroupsInMessage:maxFailureGroupsInMessage], fmt.Sprintf("and %d more", more))
 	}
-	sort.Slice(categories, func(i, j int) bool {
-		ci, cj := byCategory[categories[i]], byCategory[categories[j]]
-		if ci != cj {
-			return ci > cj
-		}
-		return categories[i] < categories[j]
-	})
-	var groups []string
-	for i, c := range categories {
-		if i == maxFailureGroupsInMessage {
-			groups = append(groups, fmt.Sprintf("and %d more", len(categories)-i))
-			break
-		}
-		groups = append(groups, fmt.Sprintf("%d %s", byCategory[c], c))
-	}
-	return strings.Join(groups, ", ") + ". See the controller logs for details."
+	return strings.Join(categories, ", ") + ". See the controller logs for details."
 }
 
 // writeStatus writes the status of krmsyncer if it differs from orig's.
@@ -294,9 +271,7 @@ type objectRef struct {
 
 // syncFailureTracker tracks, per KRMSyncer, which objects failed their latest
 // sync attempt. It is shared by all dynamic resource controllers and feeds:
-//   - status.failedObjects and the Ready message of each KRMSyncer: onChange
-//     is called (without holding the lock) with the KRMSyncer whose failed
-//     objects, or their error categories, changed;
+//   - status.failedObjects and the Ready message of each KRMSyncer;
 //   - the syncer_failed_objects metric (via gauge): an object is counted
 //     once under its GVK while it is failing for at least one KRMSyncer.
 //
@@ -307,8 +282,6 @@ type objectRef struct {
 type syncFailureTracker struct {
 	// gauge returns the failed object gauge of a GVK. May be nil.
 	gauge func(schema.GroupVersionKind) prometheus.Gauge
-	// onChange may be nil.
-	onChange func(syncer types.NamespacedName)
 
 	mu sync.Mutex
 	// failed maps each KRMSyncer's failing objects to their error category.
@@ -317,12 +290,11 @@ type syncFailureTracker struct {
 	syncers map[objectRef]int
 }
 
-func newSyncFailureTracker(gauge func(schema.GroupVersionKind) prometheus.Gauge, onChange func(types.NamespacedName)) *syncFailureTracker {
+func newSyncFailureTracker(gauge func(schema.GroupVersionKind) prometheus.Gauge) *syncFailureTracker {
 	return &syncFailureTracker{
-		gauge:    gauge,
-		onChange: onChange,
-		failed:   make(map[types.NamespacedName]map[objectRef]string),
-		syncers:  make(map[objectRef]int),
+		gauge:   gauge,
+		failed:  make(map[types.NamespacedName]map[objectRef]string),
+		syncers: make(map[objectRef]int),
 	}
 }
 
@@ -333,20 +305,16 @@ func (t *syncFailureTracker) markFailed(syncer types.NamespacedName, obj objectR
 		return
 	}
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	objs, ok := t.failed[syncer]
 	if !ok {
 		objs = make(map[objectRef]string)
 		t.failed[syncer] = objs
 	}
-	prev, already := objs[obj]
-	objs[obj] = category
-	if !already {
+	if _, already := objs[obj]; !already {
 		t.addLocked(obj, 1)
 	}
-	t.mu.Unlock()
-	if (!already || prev != category) && t.onChange != nil {
-		t.onChange(syncer)
-	}
+	objs[obj] = category
 }
 
 // markSucceeded records that obj synced for syncer, or no longer needs syncing
@@ -356,23 +324,18 @@ func (t *syncFailureTracker) markSucceeded(syncer types.NamespacedName, obj obje
 		return
 	}
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	objs := t.failed[syncer]
-	_, found := objs[obj]
-	if found {
+	if _, found := objs[obj]; found {
 		delete(objs, obj)
 		if len(objs) == 0 {
 			delete(t.failed, syncer)
 		}
 		t.addLocked(obj, -1)
 	}
-	t.mu.Unlock()
-	if found && t.onChange != nil {
-		t.onChange(syncer)
-	}
 }
 
-// forget drops the failures of syncer (e.g. it was deleted or suspended),
-// without calling onChange.
+// forget drops the failures of syncer (e.g. it was deleted or suspended).
 func (t *syncFailureTracker) forget(syncer types.NamespacedName) {
 	if t == nil {
 		return
@@ -406,39 +369,39 @@ func (t *syncFailureTracker) addLocked(obj objectRef, delta int) {
 	}
 }
 
-// failures returns the number of objects failing for syncer, and the number
-// failing with each error category.
-func (t *syncFailureTracker) failures(syncer types.NamespacedName) (int, map[string]int) {
+// failures returns the number of objects failing for syncer, and their
+// distinct error categories, sorted.
+func (t *syncFailureTracker) failures(syncer types.NamespacedName) (int, []string) {
 	if t == nil {
 		return 0, nil
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	byCategory := make(map[string]int)
+	seen := make(map[string]bool)
+	var categories []string
 	for _, category := range t.failed[syncer] {
-		byCategory[category]++
+		if !seen[category] {
+			seen[category] = true
+			categories = append(categories, category)
+		}
 	}
-	return len(t.failed[syncer]), byCategory
+	sort.Strings(categories)
+	return len(t.failed[syncer]), categories
 }
 
 // remoteHealthTracker tracks the reachability of each remote cluster, keyed by
 // RemoteConfigProvider.Key. Each remote's remoteHealth is updated from the
-// responses to its requests (see healthTransport); onChange is called with the
-// remote key when its reachability changes.
+// responses to its requests (see healthTransport).
 //
 // A nil *remoteHealthTracker tracks nothing: get returns a detached
 // remoteHealth and unreachable always returns nil.
 type remoteHealthTracker struct {
-	// onChange is called, without holding any lock, when a remote's
-	// reachability changes. May be nil.
-	onChange func(key string)
-
 	mu      sync.Mutex
 	remotes map[string]*remoteHealth
 }
 
-func newRemoteHealthTracker(onChange func(key string)) *remoteHealthTracker {
-	return &remoteHealthTracker{onChange: onChange, remotes: make(map[string]*remoteHealth)}
+func newRemoteHealthTracker() *remoteHealthTracker {
+	return &remoteHealthTracker{remotes: make(map[string]*remoteHealth)}
 }
 
 // get returns the health of the remote key, creating it on first use.
@@ -452,9 +415,6 @@ func (t *remoteHealthTracker) get(key string) *remoteHealth {
 		return h
 	}
 	h := &remoteHealth{}
-	if t.onChange != nil {
-		h.onChange = func() { t.onChange(key) }
-	}
 	t.remotes[key] = h
 	return h
 }

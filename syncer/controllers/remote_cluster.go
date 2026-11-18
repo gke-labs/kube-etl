@@ -340,10 +340,6 @@ func googleAPIErrorMessage(body []byte) string {
 // responses to the requests sent to it through healthTransport. A remote is
 // reachable until a request fails.
 type remoteHealth struct {
-	// onChange is called, without holding mu, when reachability changes.
-	// May be nil.
-	onChange func()
-
 	mu  sync.Mutex
 	err error // why the remote is unreachable; nil if reachable
 }
@@ -351,23 +347,15 @@ type remoteHealth struct {
 // markUnreachable records that the remote is unreachable because of err.
 func (h *remoteHealth) markUnreachable(err error) {
 	h.mu.Lock()
-	changed := h.err == nil
+	defer h.mu.Unlock()
 	h.err = err // keep the latest error for the status message
-	h.mu.Unlock()
-	if changed && h.onChange != nil {
-		h.onChange()
-	}
 }
 
 // markReachable records that the remote is reachable.
 func (h *remoteHealth) markReachable() {
 	h.mu.Lock()
-	changed := h.err != nil
+	defer h.mu.Unlock()
 	h.err = nil
-	h.mu.Unlock()
-	if changed && h.onChange != nil {
-		h.onChange()
-	}
 }
 
 // unreachable returns why the remote is unreachable, or nil if it is reachable.
@@ -389,8 +377,8 @@ func (h *remoteHealth) wrap(rt http.RoundTripper) http.RoundTripper {
 //   - other responses (e.g. 404, 409) and requests cancelled by the caller
 //     (e.g. a stopped watch) say nothing about reachability and are ignored.
 //
-// remoteHealth only notifies when reachability changes, so requests to a
-// healthy remote cost a mutex and a comparison.
+// Recording a response costs a mutex, so requests to a healthy remote cost
+// little.
 type healthTransport struct {
 	base   http.RoundTripper
 	health *remoteHealth

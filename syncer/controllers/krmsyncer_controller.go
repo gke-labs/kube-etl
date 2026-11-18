@@ -32,11 +32,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
@@ -78,14 +82,12 @@ type KRMSyncerReconciler struct {
 	MaxConcurrentReconciles int
 	mu                      sync.RWMutex
 
-	// remotes tracks the reachability of each remote cluster. A change queues
-	// a reconcile of the KRMSyncers using the remote.
+	// remotes tracks the reachability of each remote cluster, reported in
+	// status (Ready=RemoteUnreachable).
 	remotes *remoteHealthTracker
 	// syncFailures tracks the failed objects of each KRMSyncer, reported in
-	// status.failedObjects. A change queues a reconcile of the KRMSyncer.
+	// status.failedObjects and syncer_failed_objects.
 	syncFailures *syncFailureTracker
-	// statusMu serializes status updates (see updateStatus).
-	statusMu sync.Mutex
 }
 
 type RemoteGVK struct {
@@ -420,11 +422,31 @@ func (r *KRMSyncerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.RemoteClusters = make(map[string]cluster.Cluster)
 	r.remoteClients = newRemoteClientCache(r.RemoteConfigProvider)
 	r.setupFailures = newSetupFailureTracker(SetupFailed)
-	r.remotes = newRemoteHealthTracker(r.updateRemoteSyncersStatus)
-	r.syncFailures = newSyncFailureTracker(failedObjectsGauge, r.updateSyncerStatus)
+	r.remotes = newRemoteHealthTracker()
+	r.syncFailures = newSyncFailureTracker(failedObjectsGauge)
+	// Report changes of the trackers in status.
+	if err := mgr.Add(manager.RunnableFunc(r.updateAllStatus)); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&krmv1alpha1.KRMSyncer{}).
+		// Set up when the spec changes or on periodic resyncs (e.g. to pick up
+		// new CRDs for glob rules), but not for status-only updates such as
+		// our own status writes.
+		For(&krmv1alpha1.KRMSyncer{}, builder.WithPredicates(predicate.Or(
+			predicate.GenerationChangedPredicate{},
+			resyncPredicate(),
+		))).
 		Complete(r)
+}
+
+// resyncPredicate passes periodic resync events, which are updates where the
+// object did not change (same resourceVersion).
+func resyncPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return e.ObjectOld.GetResourceVersion() == e.ObjectNew.GetResourceVersion()
+		},
+	}
 }
 
 // DynamicResourceReconciler handles events for dynamically watched resources

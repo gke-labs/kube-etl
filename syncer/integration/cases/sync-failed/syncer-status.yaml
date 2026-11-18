@@ -5,4 +5,4 @@ conditions:
 - type: Ready
   status: "False"
   reason: SyncFailed
-  message: "1 destination object missing. See the controller logs for details."
+  message: "destination object missing. See the controller logs for details."

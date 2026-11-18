@@ -916,7 +916,7 @@ func TestApplyToDestinationIgnoresNamespaceAlreadyExists(t *testing.T) {
 		GVK:                  gvk,
 		Mode:                 krmv1alpha1.ModePull,
 		Remote:               RemoteGVK{Cluster: connKey, GVK: gvk},
-		syncFailures:         newSyncFailureTracker(func(schema.GroupVersionKind) prometheus.Gauge { return failedObjects }, nil),
+		syncFailures:         newSyncFailureTracker(func(schema.GroupVersionKind) prometheus.Gauge { return failedObjects }),
 	}
 
 	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
@@ -974,7 +974,7 @@ func TestSyncerStatusModeMissingDestination(t *testing.T) {
 	target.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "1.2.3.4"}}
 	require.NoError(t, k8sClientSource.Status().Update(ctx, target))
 	failedObjects := prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_failed_objects"})
-	syncFailures := newSyncFailureTracker(func(schema.GroupVersionKind) prometheus.Gauge { return failedObjects }, nil)
+	syncFailures := newSyncFailureTracker(func(schema.GroupVersionKind) prometheus.Gauge { return failedObjects })
 	syncerFailures := func() int {
 		n, _ := syncFailures.failures(client.ObjectKeyFromObject(syncer))
 		return n
@@ -995,8 +995,8 @@ func TestSyncerStatusModeMissingDestination(t *testing.T) {
 	assert.Equal(t, 1.0, testutil.ToFloat64(failedObjects),
 		"missing destination object should be counted as failed")
 	assert.Equal(t, 1, syncerFailures(), "the failure should be counted for the KRMSyncer")
-	_, byCategory := syncFailures.failures(client.ObjectKeyFromObject(syncer))
-	assert.Equal(t, map[string]int{"destination object missing": 1}, byCategory)
+	_, categories := syncFailures.failures(client.ObjectKeyFromObject(syncer))
+	assert.Equal(t, []string{"destination object missing"}, categories)
 
 	// Retrying while the destination object is still missing counts it once.
 	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})

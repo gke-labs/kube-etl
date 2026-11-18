@@ -174,7 +174,7 @@ func TestReadyCondition(t *testing.T) {
 		r, c := newReconciler(syncer)
 		connKey, err := testRemoteProvider.Key(syncer.Namespace, remote)
 		require.NoError(t, err)
-		r.remotes = newRemoteHealthTracker(nil)
+		r.remotes = newRemoteHealthTracker()
 		r.remotes.get(connKey).markUnreachable(stderrors.New("Unauthorized"))
 
 		_, ready, err := reconcileReady(t, r, c, client.ObjectKeyFromObject(syncer))
@@ -190,7 +190,7 @@ func TestReadyCondition(t *testing.T) {
 			Spec:       krmv1alpha1.KRMSyncerSpec{Mode: krmv1alpha1.ModePush, Remote: testRemote(destClusterName)},
 		}
 		r, c := newReconciler(syncer)
-		r.syncFailures = newSyncFailureTracker(nil, nil)
+		r.syncFailures = newSyncFailureTracker(nil)
 		key := client.ObjectKeyFromObject(syncer)
 		svc := func(name string) objectRef {
 			return objectRef{GVK: schema.GroupVersionKind{Version: "v1", Kind: "Service"}, Key: types.NamespacedName{Namespace: "ns", Name: name}}
@@ -202,19 +202,26 @@ func TestReadyCondition(t *testing.T) {
 		// Failures of other KRMSyncers are not counted.
 		r.syncFailures.markFailed(types.NamespacedName{Namespace: "default", Name: "other"}, svc("e"), "delete failed")
 
-		// Failures are grouped by error category, most frequent first.
+		// The message lists the error categories, sorted; the count is in
+		// failedObjects.
 		s, ready, err := reconcileReady(t, r, c, key)
 		require.NoError(t, err, "failed objects are retried by their own controllers")
 		assert.Equal(t, int32(3), s.Status.FailedObjects)
 		assert.Equal(t, metav1.ConditionFalse, ready.Status)
 		assert.Equal(t, krmv1alpha1.ReasonSyncFailed, ready.Reason)
-		assert.Equal(t, "2 destination object missing, 1 apply failed (Forbidden). See the controller logs for details.", ready.Message)
+		assert.Equal(t, "apply failed (Forbidden), destination object missing. See the controller logs for details.", ready.Message)
 
-		// An object failing with another error moves to that category.
+		// An object failing with another error moves to that category. While
+		// the set of categories is the same, so is the message.
 		r.syncFailures.markFailed(key, svc("a"), forbidden)
+		s, ready, err = reconcileReady(t, r, c, key)
+		require.NoError(t, err)
+		assert.Equal(t, int32(3), s.Status.FailedObjects)
+		assert.Equal(t, "apply failed (Forbidden), destination object missing. See the controller logs for details.", ready.Message)
+		r.syncFailures.markFailed(key, svc("c"), forbidden)
 		_, ready, err = reconcileReady(t, r, c, key)
 		require.NoError(t, err)
-		assert.Equal(t, "2 apply failed (Forbidden), 1 destination object missing. See the controller logs for details.", ready.Message)
+		assert.Equal(t, "apply failed (Forbidden). See the controller logs for details.", ready.Message)
 
 		// At most maxFailureGroupsInMessage categories are listed.
 		for i, name := range []string{"d", "e", "f", "g", "h"} {
@@ -222,7 +229,7 @@ func TestReadyCondition(t *testing.T) {
 		}
 		_, ready, err = reconcileReady(t, r, c, key)
 		require.NoError(t, err)
-		assert.Equal(t, "2 apply failed (Forbidden), 1 category 0, 1 category 1, 1 category 2, 1 category 3, and 2 more. See the controller logs for details.", ready.Message)
+		assert.Equal(t, "apply failed (Forbidden), category 0, category 1, category 2, category 3, and 1 more. See the controller logs for details.", ready.Message)
 
 		for _, name := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
 			r.syncFailures.markSucceeded(key, svc(name))
